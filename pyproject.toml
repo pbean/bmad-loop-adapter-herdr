@@ -38,10 +38,8 @@ dev = [
   "pytest>=8",
   "pytest-timeout>=2.3",
   "pyyaml>=6.0",
-  # Host package, installed from git (not on PyPI). Pinned to the PR #142
-  # branch until it merges (backend.py needs its parse_target); repoint to
-  # @main after.
-  "bmad-loop @ git+https://github.com/bmad-code-org/bmad-loop.git@feat/mux-helper-renames",
+  # Host package, installed from git (not on PyPI).
+  "bmad-loop @ git+https://github.com/bmad-code-org/bmad-loop.git@main",
   "black>=24",
 ]
 
