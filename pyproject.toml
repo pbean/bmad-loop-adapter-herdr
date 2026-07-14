@@ -1,0 +1,56 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bmad-loop-adapter-herdr"
+version = "0.1.0"
+description = "herdr terminal-multiplexer backend for bmad-loop"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{ name = "Paul Bean" }]
+keywords = ["bmad-loop", "herdr", "terminal-multiplexer", "adapter"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Operating System :: POSIX",
+  "Programming Language :: Python :: 3 :: Only",
+]
+# No runtime dependency on bmad-loop: it is not on PyPI, and this package must
+# be co-installed into bmad-loop's environment anyway (see README). A git
+# direct-reference here would pin an arbitrary ref and fight
+# `uv tool install bmad-loop --with bmad-loop-adapter-herdr` resolution.
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/pbean/bmad-loop-adapter-herdr"
+Issues = "https://github.com/pbean/bmad-loop-adapter-herdr/issues"
+"bmad-loop (host)" = "https://github.com/bmad-code-org/bmad-loop"
+
+# bmad-loop's external-backend discovery group: core imports this module, whose
+# import-time register_multiplexer call makes the backend selectable.
+[project.entry-points."bmad_loop.mux_backends"]
+herdr = "bmad_loop_adapter_herdr.backend"
+
+[dependency-groups]
+dev = [
+  "pytest>=8",
+  "pytest-timeout>=2.3",
+  "pyyaml>=6.0",
+  # Host package, installed from git (not on PyPI). Pinned to the PR #142
+  # branch until it merges (backend.py needs its parse_target); repoint to
+  # @main after.
+  "bmad-loop @ git+https://github.com/bmad-code-org/bmad-loop.git@feat/mux-helper-renames",
+  "black>=24",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bmad_loop_adapter_herdr"]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

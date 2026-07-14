@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.11"
+      - name: Install (bmad-loop from git + dev deps)
+        run: uv sync
+      - name: Format check
+        run: uv run black --check src tests
+      # No herdr binary in CI: the unit suite (FakeHerdr transport) runs in full;
+      # integration/E2E tests skip themselves via their HAVE_HERDR gate.
+      # TODO: add a herdr download step once herdr.dev publishes release binaries,
+      # so the gated integration tests run here too.
+      - name: Tests
+        run: uv run pytest -q
