@@ -3,7 +3,7 @@
 These mirror ``test_generic_tmux.py``'s three live tests — fake-CLI end-to-end,
 crash detection, and pipe_pane log growth — but drive them through the
 :class:`~bmad_loop_adapter_herdr.backend.HerdrMultiplexer` against a REAL herdr
-0.7.3 server. As with the tmux ones a tiny shell script stands in for the CLI
+0.7.3 server. As with the tmux ones a tiny script stands in for the CLI
 binary (it writes its own SessionStart/result.json/Stop, exactly what a
 hook-instrumented session produces), so spawn / env-propagation / hook-signal
 waiting / window-death / kill are exercised end-to-end.
@@ -13,15 +13,15 @@ private per-session herdr server + socket (``~/.config/herdr/sessions/<name>/``)
 — and forces the herdr backend by name (``BMAD_LOOP_MUX_BACKEND=herdr``); the
 sidecar is redirected into ``tmp_path``. A finalizer stops+deletes that session
 so no server, workspace, or poller thread outlives the test. The whole module is
-skipped when herdr is not installed, and on win32, where the POSIX ``exec``
-launch does not apply (the Windows launch path is a PR-6 follow-up).
+skipped when herdr is not installed. It runs on win32 too: the fakes are Python
+scripts landed via ``write_portable_cli`` (a ``.cmd`` shim there), exercising
+the ``agent start`` launch surface live.
 """
 
 from __future__ import annotations
 
 import shutil
 import subprocess
-import sys
 import time
 import uuid
 from pathlib import Path
@@ -34,27 +34,41 @@ from bmad_loop.adapters.generic import GenericTmuxAdapter
 from bmad_loop.adapters.profile import get_profile
 from bmad_loop.policy import LimitsPolicy, Policy
 
+from _stories_recipe import write_portable_cli
 from bmad_loop_adapter_herdr import backend as herdr_backend
 
-HAVE_HERDR = sys.platform != "win32" and shutil.which("herdr") is not None
+HAVE_HERDR = shutil.which("herdr") is not None
 pytestmark = pytest.mark.skipif(not HAVE_HERDR, reason="herdr not available")
 
-# Same hook-instrumented fake as test_generic_tmux.py's FAKE_CLI: the last
+# Same hook-instrumented fake as test_generic_tmux.py's FAKE_CLI (Python, so
+# write_portable_cli can spawn it on either platform family): the last
 # positional arg is the rendered prompt; the run dir + task id ride the pane env
 # (herdr `--env`, where tmux used `-e`). Emits SessionStart + result.json + Stop,
 # then idles like a live interactive session until its window is killed.
-FAKE_CLI = """#!/bin/bash
-prompt="${@: -1}"
-ts=$(date +%s%N)
-mkdir -p "$BMAD_LOOP_RUN_DIR/events" "$BMAD_LOOP_RUN_DIR/tasks/$BMAD_LOOP_TASK_ID"
-printf '{"ts": %s, "event": "SessionStart", "task_id": "%s", "session_id": "fake-1"}' \\
-    "$ts" "$BMAD_LOOP_TASK_ID" > "$BMAD_LOOP_RUN_DIR/events/$ts-$BMAD_LOOP_TASK_ID-SessionStart.json"
-echo "{\\"workflow\\": \\"auto-dev\\", \\"prompt\\": \\"$prompt\\"}" \\
-    > "$BMAD_LOOP_RUN_DIR/tasks/$BMAD_LOOP_TASK_ID/result.json"
-ts2=$(( ts + 1 ))
-printf '{"ts": %s, "event": "Stop", "task_id": "%s", "session_id": "fake-1"}' \\
-    "$ts2" "$BMAD_LOOP_TASK_ID" > "$BMAD_LOOP_RUN_DIR/events/$ts2-$BMAD_LOOP_TASK_ID-Stop.json"
-sleep 60  # stay alive like an idle interactive session
+FAKE_CLI = """import json
+import os
+import sys
+import time
+
+prompt = sys.argv[-1]
+rd = os.environ["BMAD_LOOP_RUN_DIR"]
+tid = os.environ["BMAD_LOOP_TASK_ID"]
+ts = time.time_ns()
+os.makedirs(os.path.join(rd, "events"), exist_ok=True)
+os.makedirs(os.path.join(rd, "tasks", tid), exist_ok=True)
+
+
+def event(ts_ns, name):
+    path = os.path.join(rd, "events", "%d-%s-%s.json" % (ts_ns, tid, name))
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({"ts": ts_ns, "event": name, "task_id": tid, "session_id": "fake-1"}, fh)
+
+
+event(ts, "SessionStart")
+with open(os.path.join(rd, "tasks", tid, "result.json"), "w", encoding="utf-8") as fh:
+    json.dump({"workflow": "auto-dev", "prompt": prompt}, fh)
+event(ts + 1, "Stop")
+time.sleep(60)  # stay alive like an idle interactive session
 """
 
 
@@ -105,10 +119,7 @@ def _make_adapter(
 
 
 def _write_fake_cli(tmp_path: Path, body: str = FAKE_CLI) -> Path:
-    fake = tmp_path / "fake-cli"
-    fake.write_text(body)
-    fake.chmod(0o755)
-    return fake
+    return write_portable_cli(tmp_path, "fake-cli", body)
 
 
 @pytest.mark.parametrize("profile_name", ["claude", "codex", "gemini"])
@@ -150,7 +161,7 @@ def test_herdr_crash_detected(tmp_path, herdr_session):
     an exec'd process exit vanishes the pane (no linger), so pane-presence liveness
     reports window death authoritatively — the guarantee the SessionEnd-less codex
     path relies on."""
-    fake = _write_fake_cli(tmp_path, "#!/bin/bash\nexit 1\n")
+    fake = _write_fake_cli(tmp_path, "import sys\nsys.exit(1)\n")
     adapter = _make_adapter(
         tmp_path, profile_name="codex", binary=str(fake), stop_without_result_nudges=0
     )
@@ -182,11 +193,15 @@ def test_herdr_pipe_pane_log_grows_under_real_pane(tmp_path, herdr_session, monk
     monkeypatch.setattr(herdr_backend, "POLL_INTERVAL_S", 0.25)
     # Prints a fresh non-blank line ~5×/s (blank repaints aren't logged), then
     # idles alive so the pane stays readable while we watch the log.
-    script = tmp_path / "grow.sh"
-    script.write_text(
-        '#!/bin/bash\nfor i in $(seq 1 40); do echo "MARKER line $i"; sleep 0.2; done\nsleep 30\n'
+    script = write_portable_cli(
+        tmp_path,
+        "grow",
+        "import time\n"
+        "for i in range(1, 41):\n"
+        '    print("MARKER line %d" % i, flush=True)\n'
+        "    time.sleep(0.2)\n"
+        "time.sleep(30)\n",
     )
-    script.chmod(0o755)
 
     mux = multiplexer.get_multiplexer()
     assert isinstance(mux, herdr_backend.HerdrMultiplexer)

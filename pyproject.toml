@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "bmad-loop-adapter-herdr"
-version = "0.1.0"
+version = "0.2.0"
 description = "herdr terminal-multiplexer backend for bmad-loop"
 readme = "README.md"
 license = "MIT"
@@ -15,6 +15,7 @@ classifiers = [
   "Development Status :: 4 - Beta",
   "Intended Audience :: Developers",
   "Operating System :: POSIX",
+  "Operating System :: Microsoft :: Windows",
   "Programming Language :: Python :: 3 :: Only",
 ]
 # No runtime dependency on bmad-loop: it is not on PyPI, and this package must

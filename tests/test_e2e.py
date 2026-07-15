@@ -12,7 +12,9 @@ read-back, git commit, sprint advance — resolves over herdr as it does over tm
 Deliberately just the two-story happy path: one full-stack pass proves the
 CLI-through-herdr wiring end to end; the exhaustive stories/sprint/sweep matrix
 stays on tmux in ``test_stories_e2e.py``. The module is skipped when herdr is not
-installed, and on win32, where the POSIX ``exec`` launch does not apply (PR-6).
+installed. It runs on win32 too — the vendored recipe's fake CLI is Python,
+landed via ``write_portable_cli`` — driving the ``agent start`` launch surface
+through the REAL ``bmad-loop run`` stack.
 """
 
 from __future__ import annotations
@@ -20,7 +22,6 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
-import sys
 import uuid
 
 import pytest
@@ -31,7 +32,7 @@ import pytest
 from _stories_recipe import CLI, _commit_count, _entry, _scaffold, _status
 from test_integration import _teardown_session
 
-HAVE_HERDR = sys.platform != "win32" and shutil.which("herdr") is not None
+HAVE_HERDR = shutil.which("herdr") is not None
 pytestmark = pytest.mark.skipif(not HAVE_HERDR, reason="stories E2E needs herdr")
 
 

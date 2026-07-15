@@ -52,12 +52,16 @@ automatic — press it yourself.
 | Switching back after an attach | falls back to your most recent client    | herdr has no "last client" — if the pane you came from is gone, focus stays put                                       | switch tabs yourself                                                                     |
 | Detached window size           | honors the requested geometry headless   | advisory — a detached pane takes the size of whichever client attaches                                                | nothing; the first attach may briefly reflow                                             |
 | Server lifecycle               | any tmux command starts the server       | bmad-loop starts the herdr server lazily, and only for operations that create or change something                     | nothing — `bmad-loop mux`, `validate`, and listings never resurrect a stopped server     |
+| Agent sidebar names (Windows)  | n/a                                      | Windows-launched windows appear as `name@tab-id` in herdr's agent sidebar (herdr agent names are globally unique)      | nothing — informational; window names in bmad-loop itself are unchanged                  |
 
 ## Current limits
 
-- **POSIX launches only for now.** The herdr backend launches windows through a POSIX
-  shell recipe, so it runs on Linux, macOS, and WSL today; the native-Windows launch
-  path is tracked in [this repo's issues](https://github.com/pbean/bmad-loop-adapter-herdr/issues).
+- **Windows rides herdr's beta build.** Launches are native on Windows — windows spawn
+  through herdr's `agent start` (no shell involved), and parked windows run a
+  PowerShell-5.1-compatible recipe (`pwsh` when installed, `powershell.exe` otherwise),
+  with the same banner and Enter-to-close behavior as POSIX. herdr itself ships Windows
+  binaries on a beta/preview channel, so expect that platform to mature with herdr.
+  The `ctrl+b q` detach guidance above applies unchanged.
 - **Don't hand-create `bmad-loop-*` workspaces.** herdr allows duplicate workspace labels
   (tmux session names are unique); bmad-loop refuses to create a duplicate itself and
   always resolves the first match, but a hand-made duplicate can shadow a run's real
