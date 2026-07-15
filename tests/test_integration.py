@@ -271,17 +271,31 @@ def test_herdr_parked_window_via_start_detached(herdr_session, tmp_path):
     # substituted exit status, not the echo's source)
     banner_re = re.compile(r"\[bmad-loop exited \d+")
     deadline = time.monotonic() + 30
-    screen = ""
+    screen, last = "", None
     while time.monotonic() < deadline:
-        screen = subprocess.run(
+        last = subprocess.run(
             ["herdr", "pane", "read", win_id, "--source", "recent-unwrapped"],
             capture_output=True,
             text=True,
-        ).stdout
+        )
+        screen = last.stdout
         if banner_re.search(screen):
             break
         time.sleep(0.5)
-    assert banner_re.search(screen), f"no parked banner in pane after validate: {screen[-500:]!r}"
+    if not banner_re.search(screen):
+        # Distinguish "pane rendered nothing" from "pane is GONE" (a read on a
+        # dead pane errors with empty stdout, indistinguishable from a blank
+        # screen without rc/stderr) — the difference points at opposite bugs.
+        try:
+            alive: object = mux.window_alive(launch.CTL_SESSION, win_id)
+        except Exception as exc:  # transport-level: report, don't mask the assert
+            alive = f"unknown ({exc})"
+        raise AssertionError(
+            f"no parked banner in pane after validate: screen={screen[-500:]!r} "
+            f"read_rc={last.returncode if last else None} "
+            f"read_stderr={(last.stderr if last else '').strip()[-300:]!r} "
+            f"window_alive={alive}"
+        )
     assert mux.window_alive(launch.CTL_SESSION, win_id) is True  # parked, not closed
 
     # attach-time return recording by tmux-style name target lands in the
