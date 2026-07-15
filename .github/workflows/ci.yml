@@ -17,9 +17,43 @@ jobs:
         run: uv sync
       - name: Format check
         run: uv run black --check src tests
-      # No herdr binary in CI: the unit suite (FakeHerdr transport) runs in full;
-      # integration/E2E tests skip themselves via their HAVE_HERDR gate.
-      # TODO: add a herdr download step once herdr.dev publishes release binaries,
-      # so the gated integration tests run here too.
-      - name: Tests
+      # Stable-channel herdr (install.sh has no version pin): a newer server
+      # protocol rides the backend's warn-above policy, and a hard protocol
+      # break surfaces as loud integration failures — desired. With the binary
+      # present the HAVE_HERDR-gated integration/E2E suites run here for real.
+      - name: Install herdr
+        run: |
+          curl -fsSL https://herdr.dev/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: herdr smoke
+        run: herdr --version && herdr status --json
+      - name: Tests (unit + live integration/E2E)
         run: uv run pytest -q
+
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.11"
+      - name: Install (bmad-loop from git + dev deps)
+        run: uv sync
+      # Windows builds ship on herdr's preview channel only. The installer
+      # PATHs only its own process + the user registry, which later steps
+      # don't re-read — hence the explicit GITHUB_PATH append.
+      - name: Install herdr (preview channel)
+        shell: pwsh
+        run: |
+          irm https://herdr.dev/install.ps1 | iex
+          Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $env:LOCALAPPDATA "Programs\Herdr\bin")
+          herdr --version
+      - name: Unit tests (required)
+        run: uv run pytest -q --ignore=tests/test_integration.py --ignore=tests/test_e2e.py
+      # Advisory until herdr's Windows beta proves stable headless under a CI
+      # service session (the full live suite is VM-verified green, 2026-07-14;
+      # this flag tracks CI-environment risk, not the backend). Flip to
+      # required once it has a green streak.
+      - name: Live tests (herdr beta — advisory)
+        continue-on-error: true
+        run: uv run pytest -q tests/test_integration.py tests/test_e2e.py
