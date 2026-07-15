@@ -12,20 +12,34 @@ https://github.com/bmad-code-org/bmad-loop/blob/main/docs/porting-to-a-new-os.md
 Unlike the tmux family, this backend does **not** subclass the tmux base: herdr's
 object model and CLI are a different binary family, so it implements the contract
 fresh. The mapping (characterized against herdr 0.7.3 / protocol 16 — see the
-plan's Phase-0 Findings):
+plan's Phase-0 Findings; the win32 ``agent start`` launch shape characterized on
+POSIX 0.7.3, Phase-A of issue #1, with the real-Windows-host pass tracked there):
 
 - bmad-loop session  -> herdr **workspace** (label == the session name)
-- bmad-loop window   -> herdr **tab** (one shell pane); the native window id we
-  hand back is that tab's ``root_pane.pane_id`` (``w1:p1``-shaped)
-- the launched command runs via a typed ``exec <argv>`` into that pane
-  (``pane run`` = type + Enter atomically) so process-exit == pane-close ==
-  tab-close == tmux-identical window death
+- bmad-loop window   -> herdr **tab** (one pane); the native window id we hand
+  back is that pane's id (``w1:p1``-shaped on both platform families)
+- the launched command runs so that process-exit == pane-close == tab-close ==
+  tmux-identical window death: on POSIX via a typed ``exec <argv>`` into the
+  tab's root shell (``pane run`` = type + Enter atomically); on win32 — where
+  there is no ``exec`` and the default shell's dialect is unknowable — via
+  ``agent start --tab``, which spawns argv DIRECTLY as a new pane's process in
+  the freshly created tab (``agent start`` can only ever split an existing tab,
+  never create one), after which the tab's bootstrap shell pane is closed so
+  the tab is single-pane again. That close is STRICT: a lingering shell would
+  be the tab's FIRST pane (shadowing ``_parse_target``'s root-pane resolution)
+  and a phantom immortal window in ``list_window_ids`` — which is also why the
+  win32 launch gets a rollback (both panes go) where POSIX needs none (its
+  failure leaves one benign idle tab). Agent display names are uniquified with
+  the tab id (``name@tab_id``): herdr agent names are server-global-unique
+  while their pane lives, and two concurrent runs both have a probe window;
+  nothing targets BY agent name, so the suffix is cosmetic.
 
 All herdr subprocess I/O is funnelled through :class:`_HerdrClient` (the ``_run``
 / ``_herdr`` / ``_herdr_json`` primitives plus the server lifecycle), so a future
 socket transport can replace it without touching :class:`HerdrMultiplexer`.
 
-**Degradation ledger (PR 1 = run path; PR 2 added the TUI-launch surface):**
+**Degradation ledger (PR 1 = run path; PR 2 added the TUI-launch surface; PR 3
+the native-Windows launch):**
 
 - ``pipe_pane`` has no herdr ``pipe-pane``/tee to hand off to, so it runs a
   per-window :class:`_PanePoller` daemon that snapshots ``pane read`` into the
@@ -40,8 +54,16 @@ socket transport can replace it without touching :class:`HerdrMultiplexer`.
   ``sh`` trailer can't query — so the option methods mirror the parked window's
   return option into a per-window **return file** the trailer ``cat``\\ s
   (resolved to a *tab id* at write time, keeping the trailer a dumb
-  ``herdr tab focus``). POSIX-only, like the ``exec`` launch (pwsh dialect is
-  the Windows follow-up).
+  ``herdr tab focus``). On win32 the recipe is the pwsh dialect
+  (:func:`_parked_source_pwsh`, PowerShell-5.1-compatible; ``pwsh`` preferred,
+  ``powershell`` fallback) riding ``agent start`` as ONE argv element — no
+  typed-through-shell quoting layer exists. Its trailer derives the return-file
+  path at RUNTIME from the injected ``HERDR_PANE_ID`` (the pane id doesn't
+  exist at compose time — the window IS the launch's product), which also
+  forces the one ordering deviation: the ``_PARKED_RETURN_KEY`` sidecar write
+  lands right AFTER ``agent start`` instead of before the recipe (still before
+  the method returns; residual race bounded — return-pane writes fire at
+  attach time, launch-scale later).
 - ``attach_target_argv`` accepts both target families (native pane id and the
   seam-canonical ``=session[:window]`` tokens core formats via
   ``TerminalMultiplexer.target`` — see ``_parse_target``): outside herdr it
@@ -254,7 +276,8 @@ def _remove_return_file(pane_id: str) -> None:
 
 
 def _parked_source(argv: list[str], pane_id: str) -> str:
-    """The POSIX sh source a parked window runs. Typed via ``pane run``, so it
+    """The POSIX sh source a parked window runs (win32 dialect:
+    :func:`_parked_source_pwsh`). Typed via ``pane run``, so it
     must be a single line; it passes through the pane's default shell before
     ``exec sh -c`` takes over, so it sticks to quoting every POSIX family
     member AND fish accept (single-quoted payloads with the shlex ``'"'"'``
@@ -337,8 +360,11 @@ class _HerdrClient:
     """Isolates all herdr subprocess I/O behind three spawn primitives plus the
     server-lifecycle guard, so a socket transport can swap in later."""
 
-    #: Output decoding for captured herdr text; None = locale default (POSIX),
-    #: a Windows leaf could set "utf-8". Mirrors BaseTmuxBackend._ENCODING.
+    #: Output decoding for captured herdr text — an explicit override hook;
+    #: resolved per call in _run: this attribute when set, else utf-8 on win32
+    #: (herdr emits UTF-8 everywhere, and a Windows console's legacy code page
+    #: would mangle the parked banner's em dash in `pane read` snapshots), else
+    #: the locale default. Mirrors BaseTmuxBackend._ENCODING.
     _ENCODING: str | None = None
 
     def __init__(self) -> None:
@@ -362,11 +388,16 @@ class _HerdrClient:
         timeout / missing binary always propagates raw (``TimeoutExpired`` /
         ``OSError``) — the seam-honesty guarantee is enforced one level up, in the
         helpers and contract methods, exactly as the tmux base does."""
+        encoding = self._ENCODING or ("utf-8" if _is_win32() else None)
         proc = subprocess.run(
             ["herdr", *argv],
             capture_output=True,
             text=True,
-            encoding=self._ENCODING,
+            encoding=encoding,
+            # A mojibake'd screen snapshot must degrade, not raise, inside the
+            # poller's tee thread — replacement chars are activity, an
+            # UnicodeDecodeError would kill the tee.
+            errors="replace" if encoding else None,
             env=env,
             timeout=HERDR_TIMEOUT_S,
         )
@@ -867,14 +898,17 @@ class HerdrMultiplexer(TerminalMultiplexer):
     def new_window(
         self, session: str, name: str, cwd: Path, env: dict[str, str], command: str
     ) -> str:
-        # A window is a tab with a single shell pane; the native window id we hand
-        # back is that tab's root pane id. The command (a shlex-joined argv, per
-        # the contract) is re-split and launched via a typed `exec` so process
-        # exit == pane close == tab close == tmux-identical death semantics.
+        # A window is a tab with a single pane; the native window id we hand back
+        # is that pane's id. The command (a shlex-joined argv on EVERY platform,
+        # per the contract — core never win32-quotes) is re-split and launched so
+        # process exit == pane close == tab close == tmux-identical death
+        # semantics: via a typed `exec` on POSIX, via `agent start` on win32.
         self._client.ensure_server()
         wid = self._workspace_id(session, strict=True)
         if wid is None:
             raise HerdrError(f"herdr workspace for session {session!r} not found")
+        if _is_win32():
+            return self._new_window_win32(wid, name, cwd, env, shlex.split(command))
         argv: list[str] = ["tab", "create", "--workspace", wid, "--label", name, "--cwd", str(cwd)]
         for key, val in env.items():
             argv += ["--env", f"{key}={val}"]
@@ -888,24 +922,106 @@ class HerdrMultiplexer(TerminalMultiplexer):
 
     def _launch(self, pane_id: str, argv: list[str]) -> None:
         # `pane run` types the line and presses Enter atomically. `exec` replaces
-        # the shell so the process IS the pane; POSIX-only by design (the Windows
-        # launch path uses agent.start — a Phase-6 follow-up).
+        # the shell so the process IS the pane; POSIX-only by design — win32
+        # launches never reach here (_new_window_win32's agent start is the
+        # equivalent, spawning argv with no shell to replace).
         self._client._herdr("pane", "run", pane_id, "exec " + shlex.join(argv))
+
+    def _agent_start(
+        self,
+        name: str,
+        argv: list[str],
+        *,
+        cwd: Path,
+        env: dict[str, str] | None = None,
+        tab_id: str,
+    ) -> dict:
+        """One ``agent start`` — the win32 launch verb: herdr spawns ``argv``
+        DIRECTLY as a new pane's process (no shell, so process-exit ==
+        pane-close without POSIX ``exec``). Returns the AgentInfo dict; raises
+        :class:`HerdrError` when the envelope lacks the pane identity the
+        caller is about to hand back.
+
+        Agent names are SERVER-global-unique while their pane lives (Phase-A
+        E8) — two concurrent runs both have a probe window, so the display name
+        is uniquified with the tab id (server-unique, stateless, and
+        sidebar-diagnosable; nothing ever targets BY agent name — pane ids and
+        tab labels carry targeting)."""
+        args: list[str] = ["agent", "start", f"{name}@{tab_id}", "--cwd", str(cwd)]
+        args += ["--tab", tab_id]
+        for key, val in (env or {}).items():
+            args += ["--env", f"{key}={val}"]
+        args += ["--no-focus", "--", *argv]
+        result = self._client._herdr_json(*args)
+        agent = result.get("agent")
+        if not isinstance(agent, dict) or not isinstance(agent.get("pane_id"), str):
+            raise HerdrError(f"herdr agent start did not return an agent pane: {result!r}")
+        return agent
+
+    def _new_window_win32(
+        self, wid: str, name: str, cwd: Path, env: dict[str, str], argv: list[str]
+    ) -> str:
+        # Win32 has no `exec`, so a typed launch would leave the (unknown)
+        # default shell as the pane process and break exit==death. Instead:
+        # create the tab (its label IS the window name that `=session:window`
+        # resolution keys on — `agent start` can only split, never create a
+        # tab, Phase-A E1), split the agent's process into it, then close the
+        # tab's bootstrap shell pane so the tab is single-pane again (E5). The
+        # close is STRICT: a lingering shell would be the tab's FIRST pane
+        # (shadowing _parse_target's root-pane resolution) and a phantom
+        # immortal window in list_window_ids. Env rides `agent start` — the
+        # agent process is what needs it; the doomed bootstrap shell gets none.
+        result = self._client._herdr_json(
+            "tab", "create", "--workspace", wid, "--label", name, "--cwd", str(cwd), "--no-focus"
+        )
+        shell_pane, tab_id = _root_pane_id(result), _tab_id(result)
+        if shell_pane is None or tab_id is None:
+            raise HerdrError(f"herdr tab create did not return a tab/root pane: {result!r}")
+        agent_pane: str | None = None
+        try:
+            agent = self._agent_start(name, argv, cwd=cwd, env=env, tab_id=tab_id)
+            agent_pane = agent["pane_id"]
+            self._client._herdr("pane", "close", shell_pane)
+        except MultiplexerError:
+            self._rollback_win32_launch(shell_pane, agent_pane)
+            raise
+        return agent_pane
+
+    def _rollback_win32_launch(self, shell_pane: str, agent_pane: str | None) -> None:
+        """Best-effort teardown of a half-built win32 window (tab create
+        succeeded, a later step failed). POSIX new_window has no rollback — its
+        failure leaves a benign idle tab; the win32 failure modes leave a
+        harmful TWO-pane tab (a phantom window per pane), so both panes go.
+        kill_window on the agent pane also drops its sidecar entry + return
+        file; the shell-pane close cascades the emptied tab."""
+        if agent_pane is not None:
+            try:
+                self.kill_window(agent_pane)
+            except MultiplexerError:
+                pass
+        if shutil.which("herdr"):
+            try:
+                self._client._run(["pane", "close", shell_pane], check=False)
+            except (subprocess.SubprocessError, OSError):
+                pass
 
     def new_parked_window(
         self, session: str, name: str, cwd: Path, argv: list[str], return_opt: str
     ) -> str:
-        # A fresh tab whose typed `exec sh -c '<recipe>'` runs argv, echoes the
-        # exit banner, parks on a blocking read (the exit status stays
-        # inspectable), and finally hands an attached client back to its origin
-        # via the per-window return file (see _parked_source / the module
-        # docstring's ledger). exec replaces the shell, so finishing the source
-        # closes the pane — which is also what ends a watching `terminal
-        # attach` client.
+        # A fresh tab whose recipe runs argv, echoes the exit banner, parks on a
+        # blocking read (the exit status stays inspectable), and finally hands
+        # an attached client back to its origin via the per-window return file
+        # (see _parked_source / the module docstring's ledger). On POSIX the
+        # recipe is a typed `exec sh -c '<recipe>'` — exec replaces the shell,
+        # so finishing the source closes the pane, which is also what ends a
+        # watching `terminal attach` client; win32 rides `agent start` instead
+        # (_new_parked_window_win32).
         self._client.ensure_server()
         wid = self._workspace_id(session, strict=True)
         if wid is None:
             raise HerdrError(f"herdr workspace for session {session!r} not found")
+        if _is_win32():
+            return self._new_parked_window_win32(wid, name, cwd, argv, return_opt)
         result = self._client._herdr_json(
             "tab", "create", "--workspace", wid, "--label", name, "--cwd", str(cwd), "--no-focus"
         )
@@ -936,6 +1052,51 @@ class HerdrMultiplexer(TerminalMultiplexer):
                 pass
             raise
         return pane_id
+
+    def _new_parked_window_win32(
+        self, wid: str, name: str, cwd: Path, argv: list[str], return_opt: str
+    ) -> str:
+        # The win32 parked window rides the same tab-create -> agent-start ->
+        # shell-close shape as _new_window_win32, with the agent process being
+        # a PowerShell host running the pwsh recipe (one argv element — no
+        # typed-through-default-shell quoting layer exists on win32, which is
+        # exactly why agent start is the launch verb). When the recipe's final
+        # statement ends, the PowerShell process exits -> pane closes -> tab
+        # cascades -> a blocking `terminal attach` client exits: the POSIX
+        # post-exit chain, verified for agent-started panes in Phase-A E9.
+        #
+        # ORDERING DEVIATION vs POSIX: there the _PARKED_RETURN_KEY sidecar
+        # write precedes the recipe launch (the pane id exists first); here the
+        # window id IS the launch's product, so the write happens immediately
+        # AFTER agent start — still before this method returns (no caller can
+        # hold the native id earlier) and human-scale before the trailer reads
+        # the return file at park-exit. Residual: a "=session:name"-target
+        # set_window_option racing the create->write window resolves to the
+        # doomed bootstrap shell pane and mirrors nothing — bounded, because
+        # launch.set_return_pane fires at attach time, not launch time.
+        recipe_argv = [_pwsh_binary(), "-NoProfile", "-Command", _parked_source_pwsh(argv)]
+        result = self._client._herdr_json(
+            "tab", "create", "--workspace", wid, "--label", name, "--cwd", str(cwd), "--no-focus"
+        )
+        shell_pane, tab_id = _root_pane_id(result), _tab_id(result)
+        if shell_pane is None or tab_id is None:
+            raise HerdrError(f"herdr tab create did not return a tab/root pane: {result!r}")
+        agent_pane: str | None = None
+        try:
+            agent = self._agent_start(name, recipe_argv, cwd=cwd, tab_id=tab_id)
+            agent_pane = agent["pane_id"]
+            try:
+                with _state_lock():
+                    state = _load_state()
+                    state["windows"].setdefault(agent_pane, {})[_PARKED_RETURN_KEY] = return_opt
+                    _save_state(state)
+            except OSError as exc:
+                raise HerdrError(f"herdr sidecar write failed: {exc}") from exc
+            self._client._herdr("pane", "close", shell_pane)
+        except MultiplexerError:
+            self._rollback_win32_launch(shell_pane, agent_pane)
+            raise
+        return agent_pane
 
     def list_window_ids(self, session: str) -> list[str]:
         # The engine's liveness probe: [] means "no windows", and a transport
@@ -1367,9 +1528,9 @@ def _drop_windows_for_workspace(workspace_id: str) -> None:
 
 # Self-registration: importing this module (directly, or via bmad-loop's
 # ``bmad_loop.mux_backends`` entry-point scan) makes the backend selectable.
-# `matches` is True on every platform — herdr itself is cross-platform; whether
-# it is *usable* here is `available()`'s PATH probe, and the POSIX-only launch
-# recipe is tracked as this repo's native-Windows follow-up issue. Registration
-# is name-keyed first-wins, so a bundled backend of the same name cannot shadow
-# this one once this module is imported first.
+# `matches` is True on every platform — herdr itself is cross-platform, and
+# launches are native on both families (typed exec on POSIX, agent start on
+# win32); whether it is *usable* here is `available()`'s PATH probe.
+# Registration is name-keyed first-wins, so a bundled backend of the same name
+# cannot shadow this one once this module is imported first.
 register_multiplexer("herdr", lambda platform: True, HerdrMultiplexer)
