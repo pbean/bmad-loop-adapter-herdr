@@ -45,6 +45,12 @@ class FakeHerdr:
         self.tabs: list[dict] = []  # {"tab_id","label","number","workspace_id","focused"}
         self.panes: list[dict] = []  # {"pane_id","workspace_id","tab_id","terminal_id"}
         self.calls: list[list[str]] = []
+        # Every `agent start` accepted, in launch order: {"name","argv","tab_id",
+        # "env","pane_id"} — the win32 launch tests pin against these.
+        self.agent_starts: list[dict] = []
+        # Live agent-name registry (name -> pane_id): agent names are
+        # SERVER-GLOBAL-unique, freed when their pane dies (Phase-A E8).
+        self.agent_names: dict[str, str] = {}
         # Scripted `pane read` output per pane: a list of successive raw-text
         # screens; each read advances the cursor and sticks on the last entry.
         self.pane_reads: dict[str, list[str]] = {}
@@ -225,7 +231,62 @@ class FakeHerdr:
             return self._cp(cmd, 0, out=self._pane_read_out(pane_id))
         if group == "pane" and verb in {"run", "send-text", "send-keys"}:
             return self._ok(cmd, {"type": "ok"})
+        if group == "agent" and verb == "start":
+            return self._agent_start(cmd, argv)
         return self._ok(cmd, {"type": "ok"})  # permissive fallback
+
+    def _agent_start(self, cmd, argv: list[str]) -> subprocess.CompletedProcess:
+        # Models the Phase-A-characterized semantics: `--tab` puts the agent pane
+        # INTO that tab (split, E3); `--workspace` alone splits the workspace's
+        # ACTIVE tab (E1); names are server-global-unique while their pane lives
+        # (E8); the result is the agent_started envelope with the AgentInfo the
+        # backend reads the pane identity from.
+        name = argv[2]
+        sep = argv.index("--")
+        agent_argv = argv[sep + 1 :]
+        flags = argv[3:sep]
+        holder = self.agent_names.get(name)
+        if holder is not None and any(p["pane_id"] == holder for p in self.panes):
+            return self._server_err(cmd, "agent_name_taken", f"agent name {name} is already used")
+        if "--tab" in flags:
+            tab_id = _flag(argv, "--tab")
+            tab = next((t for t in self.tabs if t["tab_id"] == tab_id), None)
+            if tab is None:
+                return self._server_err(cmd, "tab_not_found", f"tab {tab_id} not found")
+            wid = tab["workspace_id"]
+        else:
+            wid = _flag(argv, "--workspace")
+            ws = next((w for w in self.workspaces if w["workspace_id"] == wid), None)
+            if ws is None:
+                return self._server_err(cmd, "workspace_not_found", f"workspace {wid} not found")
+            tab_id = ws["active_tab_id"]
+        pane = self._new_pane(wid, tab_id)
+        env: dict[str, str] = {}
+        for i, arg in enumerate(argv[:sep]):
+            if arg == "--env":
+                key, _, val = argv[i + 1].partition("=")
+                env[key] = val
+        self.agent_names[name] = pane["pane_id"]
+        self.agent_starts.append(
+            {
+                "name": name,
+                "argv": agent_argv,
+                "tab_id": tab_id,
+                "env": env,
+                "pane_id": pane["pane_id"],
+            }
+        )
+        agent = {
+            "pane_id": pane["pane_id"],
+            "tab_id": tab_id,
+            "workspace_id": wid,
+            "terminal_id": pane["terminal_id"],
+            "agent_status": "unknown",
+            "focused": False,
+            "revision": 0,
+            "name": name,
+        }
+        return self._ok(cmd, {"type": "agent_started", "agent": agent, "argv": agent_argv})
 
 
 def install_fake_herdr(monkeypatch, tmp_path) -> FakeHerdr:
@@ -944,3 +1005,62 @@ def test_current_accessors_none_outside_herdr(fake, monkeypatch):
     assert mux.current_session() is None
     assert mux.current_pane_id() is None
     assert mux.current_window_id() is None
+
+
+# ------------------------------------------------ win32 launch surface (PR 3)
+
+
+def test_pwsh_quote_literals():
+    # Single-quoted literals: the ONLY escape is doubling the quote; everything
+    # PowerShell would otherwise interpret ($, `, ", ;, &, |) stays literal.
+    assert herdr_backend._pwsh_quote("abc") == "'abc'"
+    assert herdr_backend._pwsh_quote("it's") == "'it''s'"
+    assert herdr_backend._pwsh_quote('$env:X "q" ;&|') == "'$env:X \"q\" ;&|'"
+    assert herdr_backend._pwsh_quote("") == "''"
+    assert herdr_backend._pwsh_quote("C:\\Users\\x y") == "'C:\\Users\\x y'"
+
+
+def test_pwsh_binary_selection(monkeypatch):
+    monkeypatch.setattr(herdr_backend.shutil, "which", lambda _name: "/bin/pwsh")
+    assert herdr_backend._pwsh_binary() == "pwsh"
+    monkeypatch.setattr(herdr_backend.shutil, "which", lambda _name: None)
+    assert herdr_backend._pwsh_binary() == "powershell"
+
+
+def test_parked_source_pwsh_shape(fake):
+    src = herdr_backend._parked_source_pwsh(["python", "-m", "x", "it's"])
+    assert "\n" not in src
+    # recipe shape: encoding prelude; argv; exit capture; banner; park; trailer
+    assert src.startswith("[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; ")
+    assert "& 'python' '-m' 'x' 'it''s'; $ec=$LASTEXITCODE" in src
+    assert "if ($null -eq $ec) { $ec=127 }" in src  # POSIX command-not-found status
+    assert '"[bmad-loop exited $ec — press enter]"' in src  # byte-identical banner
+    assert "Read-Host | Out-Null" in src
+    # the trailer derives the return file at RUNTIME from the injected pane id,
+    # mirroring _return_file's ':'->'-' mapping under the sidecar's directory
+    assert "$env:HERDR_PANE_ID.Replace(':','-')" in src
+    assert "'herdr-return-' + " in src
+    state_dir = herdr_backend._pwsh_quote(str(herdr_backend._state_path().parent))
+    assert f"Join-Path {state_dir} " in src
+    assert "Remove-Item -LiteralPath $rf" in src
+    assert "-ne 'detach'" in src
+    assert "herdr tab focus $ret *> $null" in src
+
+
+def test_fake_agent_start_name_uniqueness(fake):
+    # Guard on the fake itself: names are server-global while the pane lives,
+    # freed on pane death (Phase-A E8) — the behavior the @tab-id uniquifier
+    # in the win32 launch exists to sidestep.
+    wid = fake.add_workspace("bmad-loop-x")
+    mux = HerdrMultiplexer()
+    ok = mux._client._run(["agent", "start", "dup", "--workspace", wid, "--", "sleep"])
+    assert ok.returncode == 0
+    taken = mux._client._run(
+        ["agent", "start", "dup", "--workspace", wid, "--", "sleep"], check=False
+    )
+    assert taken.returncode != 0
+    assert herdr_backend._error_code(taken) == "agent_name_taken"
+    pane_id = fake.agent_starts[0]["pane_id"]
+    fake.panes = [p for p in fake.panes if p["pane_id"] != pane_id]
+    freed = mux._client._run(["agent", "start", "dup", "--workspace", wid, "--", "sleep"])
+    assert freed.returncode == 0
