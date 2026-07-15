@@ -20,6 +20,7 @@ the ``agent start`` launch surface live.
 
 from __future__ import annotations
 
+import shlex
 import shutil
 import subprocess
 import time
@@ -208,7 +209,10 @@ def test_herdr_pipe_pane_log_grows_under_real_pane(tmp_path, herdr_session, monk
     session = "bmad-loop-grow"
     mux.new_session(session, tmp_path)
     try:
-        window_id = mux.new_window(session, "grow", tmp_path, {}, str(script))
+        # The contract command is a POSIX shlex-joined argv string on EVERY
+        # platform (a raw win32 path's backslashes would be eaten by the
+        # launch's shlex re-split) — quote it exactly as core's build_command does.
+        window_id = mux.new_window(session, "grow", tmp_path, {}, shlex.quote(str(script)))
         log_file = tmp_path / "grow.log"
         mux.pipe_pane(window_id, log_file)
 
