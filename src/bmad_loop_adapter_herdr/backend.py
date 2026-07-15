@@ -85,6 +85,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import warnings
@@ -128,6 +129,13 @@ PARKED_RETURN_DETACH = "detach"
 # consult it to mirror that option into the window's return file). "~"-prefixed
 # so it can never collide with a tmux-style "@" user option.
 _PARKED_RETURN_KEY = "~parked_return_opt"
+
+
+def _is_win32() -> bool:
+    """Live ``sys.platform`` read, never an import-time constant: the forced-win32
+    unit tests (and the registration tests before them) monkeypatch
+    ``sys.platform`` on this shared module, and the launch branch must follow."""
+    return sys.platform == "win32"
 
 
 class HerdrError(MultiplexerError):
@@ -266,6 +274,54 @@ def _parked_source(argv: list[str], pane_id: str) -> str:
         f"ret=$(cat {ret} 2>/dev/null); rm -f {ret}; "
         f'if [ -n "$ret" ] && [ "$ret" != {PARKED_RETURN_DETACH} ]; then '
         f'herdr tab focus "$ret" >/dev/null 2>&1 || true; fi'
+    )
+
+
+def _pwsh_quote(token: str) -> str:
+    """PowerShell single-quoted literal — the pwsh dialect of ``shlex.quote``.
+    Inside ``'...'`` the ONLY escape is doubling the quote itself: no
+    ``$``-expansion, no backtick processing, identical in Windows PowerShell 5.1
+    and pwsh 7."""
+    return "'" + token.replace("'", "''") + "'"
+
+
+def _pwsh_binary() -> str:
+    """``pwsh`` (PowerShell 7) when installed, else ``powershell`` (Windows
+    PowerShell 5.1, present on every supported Windows). The parked recipe sticks
+    to the 5.1-compatible subset, so the fallback is a name change, not a
+    degradation."""
+    return "pwsh" if shutil.which("pwsh") else "powershell"
+
+
+def _parked_source_pwsh(argv: list[str]) -> str:
+    """The PowerShell source a win32 parked window runs — the pwsh dialect of
+    :func:`_parked_source`, statement for statement: ``&`` call operator ↔ the
+    joined argv, ``$LASTEXITCODE`` ↔ ``$?`` (null-guarded to 127, the POSIX
+    command-not-found status, because only native commands set it), ``Write-Host``
+    ↔ ``echo`` (banner byte-identical — the ``[Console]::OutputEncoding`` prelude
+    keeps its em dash intact on legacy code pages), ``Read-Host`` ↔ ``read -r``,
+    ``Get-Content``/``Remove-Item -ErrorAction SilentlyContinue`` ↔
+    ``cat 2>/dev/null``/``rm -f``, ``*> $null`` ↔ ``>/dev/null 2>&1 || true``.
+
+    Passed to ``agent start`` as ONE argv element (never typed through a pane's
+    default shell), so no outer quoting layer exists. Unlike the POSIX recipe the
+    pane id does not exist at compose time — the window IS the launch's product —
+    so the trailer derives its return-file path AT RUNTIME from ``HERDR_PANE_ID``
+    (herdr injects it into every pane it spawns — Phase-A E6); only the sidecar
+    DIRECTORY is embedded, captured here in the launcher so the pane needs no env
+    of ours, and the ``':'→'-'`` mapping mirrors :func:`_return_file` exactly."""
+    state_dir = _pwsh_quote(str(_state_path().parent))
+    run = "& " + " ".join(_pwsh_quote(a) for a in argv)
+    return (
+        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
+        f"{run}; $ec=$LASTEXITCODE; if ($null -eq $ec) {{ $ec=127 }}; "
+        'Write-Host "[bmad-loop exited $ec — press enter]"; '
+        "Read-Host | Out-Null; "
+        f"$rf=Join-Path {state_dir} "
+        "('herdr-return-' + $env:HERDR_PANE_ID.Replace(':','-')); "
+        "$ret=Get-Content -LiteralPath $rf -ErrorAction SilentlyContinue | Select-Object -First 1; "
+        "Remove-Item -LiteralPath $rf -ErrorAction SilentlyContinue; "
+        f"if ($ret -and $ret -ne '{PARKED_RETURN_DETACH}') {{ herdr tab focus $ret *> $null }}"
     )
 
 
@@ -1266,6 +1322,13 @@ def _root_pane_id(result: dict) -> str | None:
     root = result.get("root_pane")
     if isinstance(root, dict) and isinstance(root.get("pane_id"), str):
         return root["pane_id"]
+    return None
+
+
+def _tab_id(result: dict) -> str | None:
+    tab = result.get("tab")
+    if isinstance(tab, dict) and isinstance(tab.get("tab_id"), str):
+        return tab["tab_id"]
     return None
 
 
