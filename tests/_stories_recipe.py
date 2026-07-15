@@ -8,13 +8,17 @@ completion, stories read-back, git commit, sprint advance) resolves over herdr
 as core proves it does over tmux. The scaffold/assertion helpers are verbatim;
 ``FAKE_CLI`` is trimmed to the stories-mode branch, the only path the herdr E2E
 drives (``_scaffold`` always writes a ``[stories]`` policy, so the sweep/sprint
-branches of core's fake could never fire here). Keep in sync with core if the
-recipe there changes shape.
+branches of core's fake could never fire here).
+
+DELIBERATE DIVERGENCE from the vendored original (an upstream candidate): the
+fake CLI is Python, not bash, and lands via :func:`write_portable_cli`, so the
+same E2E runs on native Windows (this repo's win32 launch surface) where a
+bash script cannot be argv[0]. Keep the recipe's BEHAVIOR in sync with core if
+the shape there changes.
 """
 
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -26,57 +30,80 @@ import yaml
 # the adapter's read-back finds a terminal spec, and stays alive until the engine
 # kills its window. Routes on the existing spec status so one script drives a fresh
 # dispatch, a plan-halt leg, its post-checkpoint implement leg, and a blocked halt.
-FAKE_CLI = r"""#!/usr/bin/env bash
-set -e
-rd="$BMAD_LOOP_RUN_DIR"; tid="$BMAD_LOOP_TASK_ID"
-story="$BMAD_LOOP_STORY_KEY"; folder="$BMAD_LOOP_SPEC_FOLDER"
-prompt="${1:-}"
-ts=$(date +%s%N)
-mkdir -p "$rd/events"
-printf '{"ts": %s, "event": "SessionStart", "task_id": "%s", "session_id": "fake-1"}' \
-    "$ts" "$tid" > "$rd/events/$ts-$tid-SessionStart.json"
-baseline=$(git rev-parse HEAD)
+# Python (not bash) so write_portable_cli can spawn it on either platform family.
+FAKE_CLI = r"""import glob
+import json
+import os
+import subprocess
+import sys
+import time
 
-sdir="$folder/stories"
-mkdir -p "$sdir"
-spec="$sdir/$story-slug.md"
-existing=$(ls "$sdir/$story"-*.md 2>/dev/null | head -1 || true)
-status=""
-[ -n "$existing" ] && status=$(sed -n 's/^status:[[:space:]]*//p' "$existing" | head -1 | tr -d "'\" ")
+rd = os.environ["BMAD_LOOP_RUN_DIR"]
+tid = os.environ["BMAD_LOOP_TASK_ID"]
+story = os.environ["BMAD_LOOP_STORY_KEY"]
+folder = os.environ["BMAD_LOOP_SPEC_FOLDER"]
 
-write_done() {
-    echo "impl for $story" >> src.txt
-    printf -- '---\ntitle: %s\nstatus: done\nbaseline_commit: %s\n---\n\n# %s\nimplemented.\n' \
-        "$story" "$baseline" "$story" > "$spec"
-}
-write_planned() {
-    printf -- '---\ntitle: %s\nstatus: ready-for-dev\nbaseline_commit: %s\n---\n\n# %s\nplanned.\n' \
-        "$story" "$baseline" "$story" > "$spec"
-}
-write_blocked() {
-    printf -- '---\ntitle: %s\nstatus: blocked\nbaseline_commit: %s\n---\n\n# %s\n\n## Auto Run Result\n\n- Status: blocked\n\nNeeds a human decision.\n' \
-        "$story" "$baseline" "$story" > "$spec"
-}
+ts = time.time_ns()
+os.makedirs(os.path.join(rd, "events"), exist_ok=True)
 
-if [ "$status" = "ready-for-dev" ] || [ "$status" = "in-progress" ] || [ "$status" = "draft" ]; then
-    write_done                       # re-dispatch after a plan-checkpoint or a re-arm
-elif [ -n "$BMAD_LOOP_PLAN_HALT" ]; then
-    write_planned                    # spec_checkpoint leg 1: halt after planning
-elif [ -f "$folder/.block-$story" ]; then
-    write_blocked                    # poisoned story: first dispatch blocks
-else
-    write_done                       # normal fresh dispatch
-fi
 
-ts2=$(( ts + 1 ))
-printf '{"ts": %s, "event": "Stop", "task_id": "%s", "session_id": "fake-1"}' \
-    "$ts2" "$tid" > "$rd/events/$ts2-$tid-Stop.json"
-sleep 30
+def event(ts_ns, name):
+    path = os.path.join(rd, "events", "%d-%s-%s.json" % (ts_ns, tid, name))
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({"ts": ts_ns, "event": name, "task_id": tid, "session_id": "fake-1"}, fh)
+
+
+event(ts, "SessionStart")
+baseline = subprocess.run(
+    ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+).stdout.strip()
+
+sdir = os.path.join(folder, "stories")
+os.makedirs(sdir, exist_ok=True)
+spec = os.path.join(sdir, story + "-slug.md")
+existing = sorted(glob.glob(os.path.join(sdir, story + "-*.md")))
+status = ""
+if existing:
+    with open(existing[0], encoding="utf-8") as fh:
+        for line in fh:
+            if line.startswith("status:"):
+                status = line.split(":", 1)[1].strip().strip("'\" ")
+                break
+
+
+def write_spec(status_word, body):
+    with open(spec, "w", encoding="utf-8") as fh:
+        fh.write(
+            "---\ntitle: %s\nstatus: %s\nbaseline_commit: %s\n---\n\n# %s\n%s\n"
+            % (story, status_word, baseline, story, body)
+        )
+
+
+def write_done():
+    with open("src.txt", "a", encoding="utf-8") as fh:
+        fh.write("impl for %s\n" % story)
+    write_spec("done", "implemented.")
+
+
+if status in ("ready-for-dev", "in-progress", "draft"):
+    write_done()  # re-dispatch after a plan-checkpoint or a re-arm
+elif os.environ.get("BMAD_LOOP_PLAN_HALT"):
+    write_spec("ready-for-dev", "planned.")  # spec_checkpoint leg 1: halt after planning
+elif os.path.isfile(os.path.join(folder, ".block-" + story)):
+    # poisoned story: first dispatch blocks
+    write_spec("blocked", "\n## Auto Run Result\n\n- Status: blocked\n\nNeeds a human decision.")
+else:
+    write_done()  # normal fresh dispatch
+
+event(ts + 1, "Stop")
+time.sleep(30)
 """
 
+# TOML literal (single-quoted) string for binary: the win32 path contains
+# backslashes, which a basic "..." TOML string would treat as escapes.
 PROFILE_TOML = """\
 name = "fakestories"
-binary = "{binary}"
+binary = '{binary}'
 bypass_args = []
 usage_parser = "none"
 skill_tree = ".claude/skills"
@@ -86,6 +113,26 @@ dialect = "claude-settings-json"
 config_path = ".claude/settings.json"
 events = {{ SessionStart = "SessionStart", Stop = "Stop" }}
 """
+
+
+def write_portable_cli(directory: Path, name: str, body: str) -> Path:
+    """Write a Python fake CLI as a file either platform's launch can spawn as
+    argv[0]: a shebanged executable on POSIX (the typed-exec launch resolves
+    it through sh), a ``.cmd`` shim around a sibling ``.py`` on win32 (the
+    ``agent start`` launch hands argv[0] to CreateProcess, which resolves
+    ``.cmd`` but neither shebangs nor ``.py`` associations)."""
+    directory.mkdir(parents=True, exist_ok=True)
+    if sys.platform == "win32":
+        script = directory / f"{name}.py"
+        script.write_text(body, encoding="utf-8")
+        shim = directory / f"{name}.cmd"
+        shim.write_text(f'@"{sys.executable}" "{script}" %*\r\n', encoding="utf-8")
+        return shim
+    launcher = directory / name
+    launcher.write_text("#!/usr/bin/env python3\n" + body, encoding="utf-8")
+    launcher.chmod(0o755)
+    return launcher
+
 
 SPEC_FOLDER = "_bmad-output/epic-1"
 CLI = [sys.executable, "-m", "bmad_loop.cli"]
@@ -164,10 +211,7 @@ def _scaffold(root: Path, entries: list[dict]) -> None:
     (folder / "SPEC.md").write_text("---\ntitle: Epic 1\n---\n# Epic 1\n", encoding="utf-8")
     (folder / "stories.yaml").write_text(yaml.safe_dump(entries, sort_keys=False), encoding="utf-8")
 
-    fake = root / ".bmad-loop" / "fake-cli.sh"
-    fake.parent.mkdir(parents=True, exist_ok=True)
-    fake.write_text(FAKE_CLI, encoding="utf-8")
-    os.chmod(fake, 0o755)
+    fake = write_portable_cli(root / ".bmad-loop", "fake-cli", FAKE_CLI)
     profiles = root / ".bmad-loop" / "profiles"
     profiles.mkdir(parents=True)
     (profiles / "fakestories.toml").write_text(
