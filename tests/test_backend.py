@@ -308,6 +308,15 @@ def fake(monkeypatch, tmp_path):
     return install_fake_herdr(monkeypatch, tmp_path)
 
 
+@pytest.fixture
+def fake_posix(fake, monkeypatch):
+    """The FakeHerdr transport with the launch dispatch pinned to the POSIX
+    path, so the typed-exec tests keep testing typed exec when the suite runs
+    on a real Windows host (the win32 twin is fake_win32, below)."""
+    monkeypatch.setattr(herdr_backend, "_is_win32", lambda: False)
+    return fake
+
+
 def _creates(fake: FakeHerdr, group: str, verb: str) -> list[list[str]]:
     return [c for c in fake.calls if c[:2] == [group, verb]]
 
@@ -359,7 +368,8 @@ def test_new_session_guards_duplicate_label(fake):
     assert len([w for w in fake.workspaces if w["label"] == "bmad-loop-x"]) == 1
 
 
-def test_new_window_tab_create_and_exec_launch(fake):
+def test_new_window_tab_create_and_exec_launch(fake_posix):
+    fake = fake_posix
     cwd = str(Path("/work"))  # backend stringifies the Path; '\\work' on win32
     fake.add_workspace("bmad-loop-x")
     mux = HerdrMultiplexer()
@@ -384,7 +394,8 @@ def test_new_window_missing_workspace_raises(fake):
         HerdrMultiplexer().new_window("bmad-loop-absent", "win", Path("/w"), {}, "echo hi")
 
 
-def test_new_window_shlex_resplit_roundtrip(fake):
+def test_new_window_shlex_resplit_roundtrip(fake_posix):
+    fake = fake_posix
     # The contract hands new_window a POSIX shlex-joined argv (generic.build_command
     # = " ".join(shlex.quote(a) ...)). The exec launch must re-split it faithfully:
     # shlex.split(command) then shlex.join back, so a tricky arg survives intact.
@@ -718,7 +729,8 @@ def test_pipe_pane_tolerates_dead_pane_and_detach_noop(fake, tmp_path):
 # ------------------------------------------------- TUI-launch surface (PR 2)
 
 
-def test_new_parked_window_recipe(fake):
+def test_new_parked_window_recipe(fake_posix):
+    fake = fake_posix
     fake.add_workspace("bmad-loop-ctl")
     mux = HerdrMultiplexer()
     pane_id = mux.new_parked_window(
@@ -758,7 +770,8 @@ def test_new_parked_window_missing_session_raises(fake, tmp_path):
         HerdrMultiplexer().new_parked_window("s", "n", tmp_path, ["echo", "hi"], RETURN_OPTION)
 
 
-def test_new_parked_window_rolls_back_tab_when_recipe_typing_fails(fake, monkeypatch):
+def test_new_parked_window_rolls_back_tab_when_recipe_typing_fails(fake_posix, monkeypatch):
+    fake = fake_posix
     # tmux gets create+launch atomically (one new-window call); here the tab
     # already exists when the recipe-typing `pane run` fails, so the backend
     # must close it again — not leave an untracked idle shell in the ctl
@@ -786,7 +799,8 @@ def test_new_parked_window_rolls_back_tab_when_recipe_typing_fails(fake, monkeyp
     assert seen["pane_id"] not in state["windows"]  # sidecar entry pruned too
 
 
-def test_new_parked_window_rolls_back_tab_when_sidecar_write_fails(fake, monkeypatch):
+def test_new_parked_window_rolls_back_tab_when_sidecar_write_fails(fake_posix, monkeypatch):
+    fake = fake_posix
     # The sidecar write sits between tab create and recipe typing; when it
     # fails there is no sidecar entry to catch the tab later, so the rollback
     # is the only thing standing between us and an orphan.
@@ -1071,10 +1085,10 @@ def test_fake_agent_start_name_uniqueness(fake):
 def fake_win32(fake, monkeypatch):
     """The FakeHerdr transport with the launch dispatch forced onto the win32
     path. Patches the backend's _is_win32 predicate, NOT sys.platform: a global
-    platform lie would drag core's platform_util into its msvcrt lock branch on
-    this POSIX test host, and the sidecar assertions want the REAL lock. The
-    live sys.platform read itself is pinned by test_run_decodes_utf8_on_win32
-    (which never touches the sidecar)."""
+    platform lie would drag core's platform_util into the OTHER platform's lock
+    branch (msvcrt vs fcntl), and the sidecar assertions want the host's REAL
+    lock. The live sys.platform read itself is pinned by
+    test_is_win32_reads_sys_platform_live."""
     monkeypatch.setattr(herdr_backend, "_is_win32", lambda: True)
     return fake
 
@@ -1287,10 +1301,20 @@ def test_win32_seam_methods_never_leak_raw_subprocess_error(boom, monkeypatch, t
         assert not isinstance(excinfo.value, OSError)
 
 
+def test_is_win32_reads_sys_platform_live(monkeypatch):
+    # Not an import-time constant: the branch must follow a monkeypatched
+    # sys.platform in either direction, whatever the real host is.
+    monkeypatch.setattr(sys, "platform", "win32")
+    assert herdr_backend._is_win32() is True
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert herdr_backend._is_win32() is False
+
+
 def test_run_decodes_utf8_on_win32(fake, monkeypatch):
     # _run resolves the decoding per call: locale default on POSIX (unchanged),
     # utf-8 + errors=replace on win32 (herdr emits UTF-8; a legacy code page
     # would mangle the banner's em dash, and a bad byte must not kill the tee).
+    # Both legs forced explicitly so the test is host-independent.
     recorded: list[dict] = []
     real_fake = fake
 
@@ -1300,16 +1324,18 @@ def test_run_decodes_utf8_on_win32(fake, monkeypatch):
 
     monkeypatch.setattr(herdr_backend.subprocess, "run", recording_run)
     mux = HerdrMultiplexer()
+    monkeypatch.setattr(herdr_backend, "_is_win32", lambda: False)
     mux.list_sessions()
     assert recorded[-1]["encoding"] is None
     assert recorded[-1]["errors"] is None
-    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(herdr_backend, "_is_win32", lambda: True)
     mux.list_sessions()
     assert recorded[-1]["encoding"] == "utf-8"
     assert recorded[-1]["errors"] == "replace"
 
 
-def test_posix_launch_never_uses_agent_start(fake):
+def test_posix_launch_never_uses_agent_start(fake_posix):
+    fake = fake_posix
     # The do-not-change-POSIX constraint, pinned: both launch surfaces on a
     # POSIX platform stay on the typed-exec path.
     fake.add_workspace("bmad-loop-x")
