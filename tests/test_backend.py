@@ -756,7 +756,9 @@ def test_new_parked_window_recipe(fake_posix):
     # recipe shape: argv; exit capture; banner; park; return trailer
     assert src.startswith("python -m x; ec=$?; ")
     assert "[bmad-loop exited $ec — press enter]" in src
-    assert "read -r" in src
+    # `read -r _`, never the bare bashism: dash (/bin/sh on Debian/Ubuntu)
+    # errors on a read with no var operand and the park falls through
+    assert "read -r _; " in src
     retfile = herdr_backend._return_file(pane_id)
     assert str(retfile) in src  # the trailer cats/rms the per-window return file
     assert 'herdr tab focus "$ret"' in src

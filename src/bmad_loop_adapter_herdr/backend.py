@@ -48,7 +48,7 @@ the native-Windows launch):**
   tmux tee would: ``generic._log_activity_key`` re-arms the dev-stall grace on
   log growth, and ``probe`` finds completion markers in the log.
 - ``new_parked_window`` types a POSIX ``exec sh -c '<argv>; ec=$?; echo
-  <banner>; read -r; <trailer>'`` recipe into a fresh tab, tmux-identical from
+  <banner>; read -r _; <trailer>'`` recipe into a fresh tab, tmux-identical from
   the operator's seat. The tmux trailer reads the return option live via
   ``show-options``; herdr window options live in OUR sidecar, which a one-line
   ``sh`` trailer can't query — so the option methods mirror the parked window's
@@ -290,10 +290,14 @@ def _parked_source(argv: list[str], pane_id: str) -> str:
     ``herdr terminal attach`` client exits when its pane closes (verified
     0.7.3)."""
     ret = shlex.quote(str(_return_file(pane_id)))
+    # `read -r _`, never bare `read -r`: POSIX requires a var operand and dash
+    # (/bin/sh on Debian/Ubuntu) errors out INSTANTLY on the bare form — the
+    # park falls through and the window closes unparked (caught by the first
+    # ubuntu-CI run of the live suite; bash's REPLY default masked it locally).
     return (
         f"{shlex.join(argv)}; ec=$?; "
         f'echo "[bmad-loop exited $ec — press enter]"; '
-        "read -r; "
+        "read -r _; "
         f"ret=$(cat {ret} 2>/dev/null); rm -f {ret}; "
         f'if [ -n "$ret" ] && [ "$ret" != {PARKED_RETURN_DETACH} ]; then '
         f'herdr tab focus "$ret" >/dev/null 2>&1 || true; fi'
