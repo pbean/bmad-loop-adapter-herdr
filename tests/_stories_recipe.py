@@ -117,10 +117,10 @@ events = {{ SessionStart = "SessionStart", Stop = "Stop" }}
 
 def write_portable_cli(directory: Path, name: str, body: str) -> Path:
     """Write a Python fake CLI as a file either platform's launch can spawn as
-    argv[0]: a shebanged executable on POSIX (the typed-exec launch resolves
-    it through sh), a ``.cmd`` shim around a sibling ``.py`` on win32 (the
-    ``agent start`` launch hands argv[0] to CreateProcess, which resolves
-    ``.cmd`` but neither shebangs nor ``.py`` associations)."""
+    argv[0]: a shebanged executable on POSIX (the typed ``exec`` launch resolves
+    it through sh), a ``.cmd`` shim around a sibling ``.py`` on win32 (the typed
+    PowerShell launch runs argv[0] through the call operator, ``& '<path>.cmd'``,
+    which resolves ``.cmd`` but neither shebangs nor ``.py`` associations)."""
     directory.mkdir(parents=True, exist_ok=True)
     if sys.platform == "win32":
         script = directory / f"{name}.py"

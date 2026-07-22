@@ -17,16 +17,22 @@ jobs:
         run: uv sync
       - name: Format check
         run: uv run black --check src tests
-      # Stable-channel herdr (install.sh has no version pin): a newer server
-      # protocol rides the backend's warn-above policy, and a hard protocol
-      # break surfaces as loud integration failures — desired. With the binary
-      # present the HAVE_HERDR-gated integration/E2E suites run here for real.
+      # Stable-channel herdr (install.sh has no version pin). The backend now
+      # REQUIRES server protocol 17 (herdr >= 0.7.5): it refuses anything below and
+      # warns once above. The smoke step asserts the installed stable binary is
+      # protocol 17, so a stable channel that ever regresses below 17 hard-fails
+      # here with a clear message instead of as opaque live-suite errors — desired.
+      # With the binary present the HAVE_HERDR-gated integration/E2E suites run here
+      # for real.
       - name: Install herdr
         run: |
           curl -fsSL https://herdr.dev/install.sh | sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-      - name: herdr smoke
-        run: herdr --version && herdr status --json
+      - name: herdr smoke (require protocol 17)
+        run: |
+          herdr --version
+          herdr status --json
+          herdr api schema | grep -qx 'protocol: 17'
       - name: Tests (unit + live integration/E2E)
         run: uv run pytest -q
 

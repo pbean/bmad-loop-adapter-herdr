@@ -156,13 +156,13 @@ def test_detect_multiplexers_lists_herdr_row(fresh_registry, monkeypatch):
     `tmux -V`."""
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setattr(shutil, "which", _which_only("tmux", "herdr"))
-    monkeypatch.setattr(HerdrMultiplexer, "version", lambda self: "herdr 0.7.3")
+    monkeypatch.setattr(HerdrMultiplexer, "version", lambda self: "herdr 0.7.5")
     monkeypatch.setattr(TmuxMultiplexer, "version", lambda self: "tmux 3.5")
     rows = {r.name: r for r in fresh_registry.detect_multiplexers()}
     assert {"tmux", "herdr"} <= set(rows)
     assert rows["herdr"].matches_platform is True
     assert rows["herdr"].available is True
-    assert rows["herdr"].version == "herdr 0.7.3"
+    assert rows["herdr"].version == "herdr 0.7.5"
     # tmux is the POSIX platform default, so it stays selected — herdr is listed but not chosen
     assert rows["tmux"].selected is True
     assert rows["herdr"].selected is False and rows["herdr"].reason == ""
@@ -184,3 +184,13 @@ def test_entry_point_is_declared():
     ours = [ep for ep in eps if ep.name == "herdr"]
     assert ours, "bmad_loop.mux_backends entry point 'herdr' not found — package not installed?"
     assert ours[0].value == "bmad_loop_adapter_herdr.backend"
+
+
+def test_version_matches_distribution_metadata():
+    """``__version__`` and the installed distribution's version (from ``pyproject``)
+    must agree — a drift-guard so bumping one without the other fails loudly (both
+    were bumped 0.2.0 -> 0.3.0 for the herdr-0.7.5 release). CI fresh-syncs, so the
+    installed metadata is always current there."""
+    from bmad_loop_adapter_herdr import __version__
+
+    assert importlib.metadata.version("bmad-loop-adapter-herdr") == __version__

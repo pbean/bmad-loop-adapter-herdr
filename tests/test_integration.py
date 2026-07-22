@@ -3,26 +3,29 @@
 These mirror ``test_generic_tmux.py``'s three live tests — fake-CLI end-to-end,
 crash detection, and pipe_pane log growth — but drive them through the
 :class:`~bmad_loop_adapter_herdr.backend.HerdrMultiplexer` against a REAL herdr
-0.7.3 server. As with the tmux ones a tiny script stands in for the CLI
+0.7.5 server. As with the tmux ones a tiny script stands in for the CLI
 binary (it writes its own SessionStart/result.json/Stop, exactly what a
 hook-instrumented session produces), so spawn / env-propagation / hook-signal
 waiting / window-death / kill are exercised end-to-end.
 
-Isolation: each test runs under its own ``HERDR_SESSION=bmad-test-<uuid>`` — a
-private per-session herdr server + socket (``~/.config/herdr/sessions/<name>/``)
-— and forces the herdr backend by name (``BMAD_LOOP_MUX_BACKEND=herdr``); the
-sidecar is redirected into ``tmp_path``. A finalizer stops+deletes that session
-so no server, workspace, or poller thread outlives the test. The whole module is
-skipped when herdr is not installed. It runs on win32 too: the fakes are Python
-scripts landed via ``write_portable_cli`` (a ``.cmd`` shim there), exercising
-the ``agent start`` launch surface live.
+Isolation: each test runs on a PRIVATE herdr server — a throwaway socket plus
+config/state root (``HERDR_SOCKET_PATH`` + ``XDG_CONFIG_HOME``/``XDG_STATE_HOME``;
+see :func:`_isolate_herdr`), so a test never touches the user's real server or its
+session state — and forces the herdr backend by name (``BMAD_LOOP_MUX_BACKEND=herdr``);
+the sidecar is redirected into ``tmp_path``. A finalizer stops that server and removes
+its root, so no server, workspace, or poller thread outlives the test. The whole module
+is skipped when herdr is not installed. It runs on win32 too: the fakes are Python
+scripts landed via ``write_portable_cli`` (a ``.cmd`` shim there), exercising the
+``pane run`` typed-launch surface live.
 """
 
 from __future__ import annotations
 
+import os
 import shlex
 import shutil
 import subprocess
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -73,34 +76,65 @@ time.sleep(60)  # stay alive like an idle interactive session
 """
 
 
-def _teardown_session(name: str) -> None:
-    """Tear down an isolated herdr session (its server + socket + everything under
-    it). Best-effort: a never-started session makes both verbs harmless no-ops."""
-    for verb in ("stop", "delete"):
-        subprocess.run(["herdr", "session", verb, name], capture_output=True, text=True)
+def _isolate_herdr(monkeypatch, tmp_path) -> Path:
+    """Redirect every ``herdr`` this test spawns onto a PRIVATE 0.7.5 server, fully
+    isolated from the user's real server and persisted session state.
+
+    herdr 0.7.5 dropped the ``HERDR_SESSION`` env var that 0.7.3 used for a private
+    per-session socket (only the ``--session`` *flag* still routes, and this backend
+    spawns fixed ``herdr <verb>`` argv — it never adds a flag). Isolation is now
+    three env vars, inherited by every spawned ``herdr`` and by the real
+    ``bmad-loop`` child (``_run`` copies ``os.environ``):
+
+    - ``HERDR_SOCKET_PATH`` -> a fresh socket, so ``ensure_server`` brings up a NEW
+      server here instead of attaching the user's running one. Kept under a short
+      ``tempfile`` dir so the path stays within ``sun_path``'s ~108-byte cap.
+    - ``XDG_CONFIG_HOME`` / ``XDG_STATE_HOME`` -> a private config/state root, so the
+      server restores from an EMPTY session snapshot (not the user's
+      ``~/.config/herdr/session.json``) and persists its own back there — the user's
+      real workspaces are never read or overwritten.
+
+    Returns the private root; the caller's finalizer (:func:`_teardown_server`)
+    stops the server and removes it. ``BMAD_LOOP_HERDR_STATE`` still redirects
+    bmad-loop's own sidecar out of ``~/.bmad-loop``."""
+    base = Path(tempfile.mkdtemp(prefix="hdr-"))
+    monkeypatch.setenv("HERDR_SOCKET_PATH", str(base / "h.sock"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(base / "cfg"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(base / "state"))
+    monkeypatch.setenv("BMAD_LOOP_MUX_BACKEND", "herdr")
+    monkeypatch.setenv("BMAD_LOOP_HERDR_STATE", str(tmp_path / "herdr-state.json"))
+    return base
+
+
+def _teardown_server(base: Path) -> None:
+    """Stop this test's private herdr server and remove its root. Best-effort: a
+    never-started server makes ``server stop`` a harmless no-op. The isolation env
+    is passed explicitly (not left to monkeypatch teardown ordering) so ``server
+    stop`` always routes to the private socket, never the user's default server."""
+    env = {
+        **os.environ,
+        "HERDR_SOCKET_PATH": str(base / "h.sock"),
+        "XDG_CONFIG_HOME": str(base / "cfg"),
+        "XDG_STATE_HOME": str(base / "state"),
+    }
+    subprocess.run(["herdr", "server", "stop"], capture_output=True, text=True, env=env)
+    shutil.rmtree(base, ignore_errors=True)
 
 
 @pytest.fixture
 def herdr_session(tmp_path, monkeypatch):
-    """Isolate the herdr backend onto a private per-test server/socket and force it
-    selected by name, with a guaranteed teardown.
-
-    ``HERDR_SESSION`` gives every ``herdr`` subprocess this backend spawns its own
-    server + socket, so tests never touch the user's default session or each other
-    (safe under xdist — the name is unique per test). ``BMAD_LOOP_MUX_BACKEND=herdr``
-    + a cache clear on both ends makes ``get_multiplexer()`` pick herdr regardless
-    of host platform (and not leak the pick). The sidecar is redirected out of
-    ``~/.bmad-loop``. The finalizer stops+deletes the session even on failure."""
-    name = f"bmad-test-{uuid.uuid4().hex[:12]}"
-    monkeypatch.setenv("HERDR_SESSION", name)
-    monkeypatch.setenv("BMAD_LOOP_MUX_BACKEND", "herdr")
-    monkeypatch.setenv("BMAD_LOOP_HERDR_STATE", str(tmp_path / "herdr-state.json"))
+    """Isolate the herdr backend onto a private per-test 0.7.5 server + config/state
+    root and force it selected by name, with a guaranteed teardown. See
+    :func:`_isolate_herdr` for the mechanism (``HERDR_SESSION`` is gone in 0.7.5).
+    ``get_multiplexer`` is cache-cleared on both ends so the pick is herdr
+    regardless of host platform (and does not leak). Yields the private root."""
+    base = _isolate_herdr(monkeypatch, tmp_path)
     multiplexer.get_multiplexer.cache_clear()
     try:
-        yield name
+        yield base
     finally:
         multiplexer.get_multiplexer.cache_clear()
-        _teardown_session(name)
+        _teardown_server(base)
 
 
 def _make_adapter(

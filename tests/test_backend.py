@@ -70,8 +70,7 @@ class FakeHerdr:
         number = self._tab_seq[wid]
         tab = {
             # real herdr gives an unlabelled tab its NUMBER as the label (a
-            # workspace's root shell tab is "1" — verified 0.7.3, pending 0.7.5
-            # re-verification)
+            # workspace's root shell tab is "1" — verified 0.7.5)
             "tab_id": f"{wid}:t{number}",
             "label": label if label is not None else str(number),
             "number": number,

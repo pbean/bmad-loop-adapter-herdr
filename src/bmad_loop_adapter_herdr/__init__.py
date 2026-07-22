@@ -7,6 +7,6 @@ the ``bmad_loop.mux_backends`` entry point does that import automatically.
 
 from .backend import HerdrError, HerdrMultiplexer
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = ["HerdrError", "HerdrMultiplexer", "__version__"]

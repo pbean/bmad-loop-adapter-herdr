@@ -11,9 +11,10 @@ https://github.com/bmad-code-org/bmad-loop/blob/main/docs/porting-to-a-new-os.md
 
 Unlike the tmux family, this backend does **not** subclass the tmux base: herdr's
 object model and CLI are a different binary family, so it implements the contract
-fresh. The mapping (herdr 0.7.5 / protocol 17 — see the plan's Findings; the
-win32 typed-PowerShell launch shape awaits its live re-verification against a
-real 0.7.5 Windows host, tracked in the plan's Phases 3-4):
+fresh. The mapping (herdr 0.7.5 / protocol 17 — the POSIX launch and parked-window
+flows are live-verified against a real 0.7.5 server; the win32 typed-PowerShell
+launch shape still awaits live re-verification on a real 0.7.5 Windows host, where
+herdr ships on its preview channel):
 
 - bmad-loop session  -> herdr **workspace** (label == the session name)
 - bmad-loop window   -> herdr **tab** (one pane); the native window id we hand
@@ -74,8 +75,7 @@ the native-Windows launch):**
   "focus", <tab_id>]`` — the switch-client move, mirroring tmux's in-``TMUX``
   branch. Raises ``HerdrError`` with operator guidance when unresolvable.
 - ``switch_client`` is a ``tab focus`` on the target's tab (focusing a tab in
-  another workspace flips workspace focus too — verified 0.7.3, pending 0.7.5
-  live re-verification). herdr has no
+  another workspace flips workspace focus too — verified 0.7.5). herdr has no
   "last client" concept, so ``last_fallback`` has nothing to fall back to and
   a failed switch is honestly ``False``.
 - ``current_return_target`` (bmad-loop 0.9.0 seam) is **deliberately NOT
@@ -309,10 +309,10 @@ def _parked_source(argv: list[str], pane_id: str) -> str:
 
     After the park, the trailer hands an attached client back to its origin:
     the return file holds a tab id to focus (one ``tab focus`` also flips
-    workspace focus — verified 0.7.3, pending 0.7.5 live re-verification) or
+    workspace focus — verified 0.7.5) or
     :data:`PARKED_RETURN_DETACH`, where doing NOTHING is correct — ending the
     source closes the pane, and a ``herdr terminal attach`` client exits when
-    its pane closes (verified 0.7.3, pending 0.7.5 live re-verification)."""
+    its pane closes (verified 0.7.5)."""
     ret = shlex.quote(str(_return_file(pane_id)))
     # `read -r _`, never bare `read -r`: POSIX requires a var operand and dash
     # (/bin/sh on Debian/Ubuntu) errors out INSTANTLY on the bare form — the
@@ -1394,9 +1394,8 @@ class HerdrMultiplexer(TerminalMultiplexer):
 
     def switch_client(self, target: str, last_fallback: bool = False) -> bool:
         # The herdr "switch client" move is a tab focus: focusing a tab also
-        # flips workspace focus when it lives elsewhere (verified 0.7.3, pending
-        # 0.7.5 live re-verification), so one verb covers the whole
-        # return-to-origin hop. True iff the focus landed.
+        # flips workspace focus when it lives elsewhere (verified 0.7.5), so one
+        # verb covers the whole return-to-origin hop. True iff the focus landed.
         # herdr has no "last client" concept, so last_fallback has nothing to
         # fall back to and a failed switch is honestly False.
         pane_id = self._parse_target(target, strict=False)

@@ -7,11 +7,13 @@ workspace/tab model, so agent sessions, the TUI's launch/attach keys, log tees, 
 detection, and completion probes all run over herdr instead of tmux — including on hosts
 where tmux isn't an option.
 
-Characterized against **herdr 0.7.3** (server protocol **16**). Launches are native on
-both platform families: a typed `exec` on POSIX (Linux, macOS, WSL) and herdr's
-`agent start` on Windows, where parked windows run a PowerShell-5.1-compatible recipe
-(`pwsh` preferred when installed, `powershell.exe` otherwise). Note that herdr's own
-Windows build is currently beta.
+Characterized against **herdr 0.7.5** (server protocol **17**). Launches are native on
+both platform families and typed into a fresh tab's default shell via `pane run`: a
+typed `exec <argv>` on POSIX (Linux, macOS, WSL) and, on Windows, a typed
+`& <argv>; exit $LASTEXITCODE` in PowerShell, where parked windows run a
+PowerShell-5.1-compatible recipe (`pwsh` preferred when installed, `powershell.exe`
+otherwise). The Windows tab shell must stay PowerShell (herdr's `terminal.default_shell`,
+its default). Note that herdr's own Windows build ships on a preview channel.
 
 ## Install
 
@@ -61,10 +63,12 @@ uv run pytest -q               # unit tests run everywhere;
 uv run black --check src tests
 ```
 
-The integration and E2E tests drive a **real, private herdr server** per test
-(`HERDR_SESSION=bmad-test-<uuid>`) and are skipped automatically when `herdr` is not on
-PATH. They run on Windows too — the fake CLIs are Python scripts spawned through the
-`agent start` launch surface.
+The integration and E2E tests drive a **real, private herdr server** per test —
+isolated onto a throwaway socket plus config/state root (`HERDR_SOCKET_PATH` +
+`XDG_CONFIG_HOME`/`XDG_STATE_HOME`), so they never touch your own herdr server or its
+session state — and are skipped automatically when `herdr` is not on PATH. They run on
+Windows too — the fake CLIs are Python scripts typed through the `pane run` launch
+surface.
 
 ## Provenance
 
