@@ -57,7 +57,7 @@ jobs:
       - name: Unit tests (required)
         run: uv run pytest -q --ignore=tests/test_integration.py --ignore=tests/test_e2e.py
       # Advisory until herdr's Windows beta proves stable headless under a CI
-      # service session (the full live suite is VM-verified green, 2026-07-14;
+      # service session (the full live suite is VM-verified green, 2026-07-22;
       # this flag tracks CI-environment risk, not the backend). Flip to
       # required once it has a green streak.
       - name: Live tests (herdr beta — advisory)
