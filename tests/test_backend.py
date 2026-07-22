@@ -39,19 +39,13 @@ class FakeHerdr:
     (a running flag, a protocol number, workspaces, panes), answers the CLI verbs
     this backend uses with herdr's real envelope shapes, and records every argv."""
 
-    def __init__(self, *, running: bool = True, protocol: int = 16) -> None:
+    def __init__(self, *, running: bool = True, protocol: int = 17) -> None:
         self.running = running
         self.protocol = protocol
         self.workspaces: list[dict] = []  # {"label","workspace_id","active_tab_id"}
         self.tabs: list[dict] = []  # {"tab_id","label","number","workspace_id","focused"}
         self.panes: list[dict] = []  # {"pane_id","workspace_id","tab_id","terminal_id"}
         self.calls: list[list[str]] = []
-        # Every `agent start` accepted, in launch order: {"name","argv","tab_id",
-        # "env","pane_id"} — the win32 launch tests pin against these.
-        self.agent_starts: list[dict] = []
-        # Live agent-name registry (name -> pane_id): agent names are
-        # SERVER-GLOBAL-unique, freed when their pane dies (Phase-A E8).
-        self.agent_names: dict[str, str] = {}
         # Scripted `pane read` output per pane: a list of successive raw-text
         # screens; each read advances the cursor and sticks on the last entry.
         self.pane_reads: dict[str, list[str]] = {}
@@ -59,6 +53,11 @@ class FakeHerdr:
         # Seedable `pane process-info` payloads: pane_id -> process_info dict
         # (0.7.5 shape); an unseeded pane answers pane_not_found.
         self.process_infos: dict[str, dict] = {}
+        # `pane rename` labels the win32 typed launch applies: pane_id -> name.
+        self.pane_labels: dict[str, str] = {}
+        # When True, `pane wait-output` answers rc=1 (a prompt-readiness timeout)
+        # so a test can prove the win32 typed launch proceeds anyway.
+        self.wait_output_fails = False
         self._ws_seq = 0
         self._tab_seq: dict[str, int] = {}
         self._pane_seq: dict[str, int] = {}
@@ -71,7 +70,8 @@ class FakeHerdr:
         number = self._tab_seq[wid]
         tab = {
             # real herdr gives an unlabelled tab its NUMBER as the label (a
-            # workspace's root shell tab is "1" — verified 0.7.3)
+            # workspace's root shell tab is "1" — verified 0.7.3, pending 0.7.5
+            # re-verification)
             "tab_id": f"{wid}:t{number}",
             "label": label if label is not None else str(number),
             "number": number,
@@ -163,12 +163,19 @@ class FakeHerdr:
 
     def _dispatch(self, cmd, argv: list[str]) -> subprocess.CompletedProcess:
         if argv == ["--version"]:
-            return self._cp(cmd, 0, out="herdr 0.7.3")
+            return self._cp(cmd, 0, out="herdr 0.7.5")
         if argv[:2] == ["status", "--json"]:
             server = {"running": self.running, "protocol": self.protocol if self.running else None}
             return self._cp(cmd, 0, out=json.dumps({"server": server}))
         group = argv[0] if argv else ""
-        if not self.running and group in {"workspace", "pane", "tab", "agent", "wait"}:
+        if group == "agent":
+            # herdr 0.7.5 redesigned `agent start` to only start KNOWN agent kinds
+            # in an existing pane; the general argv-spawning form the win32 launch
+            # used to ride is gone. The backend must emit ZERO agent verbs now — a
+            # loud tripwire (clap's rc=2 "unexpected argument") so a regression
+            # reviving the old path fails the launch instead of silently no-op'ing.
+            return self._cp(cmd, 2, err="error: unexpected argument found")
+        if not self.running and group in {"workspace", "pane", "tab"}:
             return self._down(cmd)
         verb = argv[1] if len(argv) > 1 else ""
         if group == "workspace" and verb == "list":
@@ -244,64 +251,24 @@ class FakeHerdr:
                 return self._bare_err(cmd, "pane_not_found", f"pane {pane_id} not found")
             # pane read prints RAW TEXT, not a JSON envelope.
             return self._cp(cmd, 0, out=self._pane_read_out(pane_id))
+        if group == "pane" and verb == "rename":
+            # Best-effort win32 sidebar label — record it; the backend never
+            # inspects the result (see _label_pane).
+            self.pane_labels[argv[2]] = argv[3]
+            return self._ok(cmd, {"type": "ok"})
+        if group == "pane" and verb == "wait-output":
+            # win32 prompt-readiness wait: rc=1 on timeout (scriptable via
+            # wait_output_fails so a test can prove the launch proceeds anyway),
+            # else ok when the pane exists.
+            pane_id = argv[-1]
+            if self.wait_output_fails:
+                return self._server_err(cmd, "wait_output_timeout", "no match before timeout")
+            if not any(p["pane_id"] == pane_id for p in self.panes):
+                return self._server_err(cmd, "pane_not_found", f"pane {pane_id} not found")
+            return self._ok(cmd, {"type": "ok"})
         if group == "pane" and verb in {"run", "send-text", "send-keys"}:
             return self._ok(cmd, {"type": "ok"})
-        if group == "agent" and verb == "start":
-            return self._agent_start(cmd, argv)
         return self._ok(cmd, {"type": "ok"})  # permissive fallback
-
-    def _agent_start(self, cmd, argv: list[str]) -> subprocess.CompletedProcess:
-        # Models the Phase-A-characterized semantics: `--tab` puts the agent pane
-        # INTO that tab (split, E3); `--workspace` alone splits the workspace's
-        # ACTIVE tab (E1); names are server-global-unique while their pane lives
-        # (E8); the result is the agent_started envelope with the AgentInfo the
-        # backend reads the pane identity from.
-        name = argv[2]
-        sep = argv.index("--")
-        agent_argv = argv[sep + 1 :]
-        flags = argv[3:sep]
-        holder = self.agent_names.get(name)
-        if holder is not None and any(p["pane_id"] == holder for p in self.panes):
-            return self._server_err(cmd, "agent_name_taken", f"agent name {name} is already used")
-        if "--tab" in flags:
-            tab_id = _flag(argv, "--tab")
-            tab = next((t for t in self.tabs if t["tab_id"] == tab_id), None)
-            if tab is None:
-                return self._server_err(cmd, "tab_not_found", f"tab {tab_id} not found")
-            wid = tab["workspace_id"]
-        else:
-            wid = _flag(argv, "--workspace")
-            ws = next((w for w in self.workspaces if w["workspace_id"] == wid), None)
-            if ws is None:
-                return self._server_err(cmd, "workspace_not_found", f"workspace {wid} not found")
-            tab_id = ws["active_tab_id"]
-        pane = self._new_pane(wid, tab_id)
-        env: dict[str, str] = {}
-        for i, arg in enumerate(argv[:sep]):
-            if arg == "--env":
-                key, _, val = argv[i + 1].partition("=")
-                env[key] = val
-        self.agent_names[name] = pane["pane_id"]
-        self.agent_starts.append(
-            {
-                "name": name,
-                "argv": agent_argv,
-                "tab_id": tab_id,
-                "env": env,
-                "pane_id": pane["pane_id"],
-            }
-        )
-        agent = {
-            "pane_id": pane["pane_id"],
-            "tab_id": tab_id,
-            "workspace_id": wid,
-            "terminal_id": pane["terminal_id"],
-            "agent_status": "unknown",
-            "focused": False,
-            "revision": 0,
-            "name": name,
-        }
-        return self._ok(cmd, {"type": "agent_started", "agent": agent, "argv": agent_argv})
 
 
 def install_fake_herdr(monkeypatch, tmp_path) -> FakeHerdr:
@@ -341,7 +308,7 @@ def _creates(fake: FakeHerdr, group: str, verb: str) -> list[list[str]]:
 def test_available_and_version(fake):
     mux = HerdrMultiplexer()
     assert mux.available() is True
-    assert mux.version() == "herdr 0.7.3"
+    assert mux.version() == "herdr 0.7.5"
 
 
 def test_available_false_without_binary(monkeypatch):
@@ -1114,8 +1081,19 @@ def test_pwsh_binary_selection(monkeypatch):
     assert herdr_backend._pwsh_binary() == "powershell"
 
 
+def test_typed_launch_pwsh_shape():
+    # `& <pwsh-quoted argv>; exit $LASTEXITCODE`: the call operator runs argv and
+    # `exit` ends the shell with the child's status (process-exit == pane-close,
+    # the POSIX `exec` mirror). _pwsh_quote is the ONLY quoting layer.
+    assert herdr_backend._typed_launch_pwsh(["echo", "hi"]) == "& 'echo' 'hi'; exit $LASTEXITCODE"
+    line = herdr_backend._typed_launch_pwsh(["c md", "a&&b", "it's"])
+    assert line == "& 'c md' 'a&&b' 'it''s'; exit $LASTEXITCODE"  # spaces/&& stay literal
+    assert "\n" not in line
+
+
 def test_parked_source_pwsh_shape(fake):
-    src = herdr_backend._parked_source_pwsh(["python", "-m", "x", "it's"])
+    pane_id = "w1:p1"
+    src = herdr_backend._parked_source_pwsh(["python", "-m", "x", "it's"], pane_id)
     assert "\n" not in src
     # recipe shape: encoding prelude; argv; exit capture; banner; park; trailer
     assert src.startswith("[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; ")
@@ -1123,34 +1101,16 @@ def test_parked_source_pwsh_shape(fake):
     assert "if ($null -eq $ec) { $ec=127 }" in src  # POSIX command-not-found status
     assert '"[bmad-loop exited $ec — press enter]"' in src  # byte-identical banner
     assert "Read-Host | Out-Null" in src
-    # the trailer derives the return file at RUNTIME from the injected pane id,
-    # mirroring _return_file's ':'->'-' mapping under the sidecar's directory
-    assert "$env:HERDR_PANE_ID.Replace(':','-')" in src
-    assert "'herdr-return-' + " in src
-    state_dir = herdr_backend._pwsh_quote(str(herdr_backend._state_path().parent))
-    assert f"Join-Path {state_dir} " in src
-    assert "Remove-Item -LiteralPath $rf" in src
+    # the pane id exists at compose time (the recipe is TYPED, not spawned), so
+    # the return-file path is embedded as a pwsh literal — no runtime
+    # HERDR_PANE_ID / Join-Path derivation (the POSIX recipe's posture, mirrored)
+    rf = herdr_backend._pwsh_quote(str(herdr_backend._return_file(pane_id)))
+    assert f"Get-Content -LiteralPath {rf} " in src
+    assert f"Remove-Item -LiteralPath {rf} " in src
+    assert "$env:HERDR_PANE_ID" not in src
+    assert "Join-Path" not in src
     assert "-ne 'detach'" in src
     assert "herdr tab focus $ret *> $null" in src
-
-
-def test_fake_agent_start_name_uniqueness(fake):
-    # Guard on the fake itself: names are server-global while the pane lives,
-    # freed on pane death (Phase-A E8) — the behavior the @tab-id uniquifier
-    # in the win32 launch exists to sidestep.
-    wid = fake.add_workspace("bmad-loop-x")
-    mux = HerdrMultiplexer()
-    ok = mux._client._run(["agent", "start", "dup", "--workspace", wid, "--", "sleep"])
-    assert ok.returncode == 0
-    taken = mux._client._run(
-        ["agent", "start", "dup", "--workspace", wid, "--", "sleep"], check=False
-    )
-    assert taken.returncode != 0
-    assert herdr_backend._error_code(taken) == "agent_name_taken"
-    pane_id = fake.agent_starts[0]["pane_id"]
-    fake.panes = [p for p in fake.panes if p["pane_id"] != pane_id]
-    freed = mux._client._run(["agent", "start", "dup", "--workspace", wid, "--", "sleep"])
-    assert freed.returncode == 0
 
 
 @pytest.fixture
@@ -1165,56 +1125,62 @@ def fake_win32(fake, monkeypatch):
     return fake
 
 
-def test_new_window_win32_agent_start_launch(fake_win32):
+def test_new_window_win32_typed_pwsh_launch(fake_win32):
     fake = fake_win32
     cwd = str(Path("/work"))
     fake.add_workspace("bmad-loop-x")
     mux = HerdrMultiplexer()
     pane_id = mux.new_window("bmad-loop-x", "win", Path("/work"), {"A": "1", "B": "2"}, "echo hi")
-    # tab create keeps the label (window-name resolution) but carries NO env —
-    # the bootstrap shell is doomed; env rides agent start with the process
+    # tab create carries the label (window-name resolution) AND the env now — the
+    # tab's default PowerShell pane is the launch target, no doomed bootstrap
     (tab_create,) = _creates(fake, "tab", "create")
     assert tab_create == [
         "tab", "create",
         "--workspace", "w1",
         "--label", "win",
         "--cwd", cwd,
-        "--no-focus",
-    ]  # fmt: skip
-    tab_id = fake.agent_starts[0]["tab_id"]
-    (agent_start,) = _creates(fake, "agent", "start")
-    assert agent_start == [
-        "agent", "start", f"win@{tab_id}",
-        "--cwd", cwd,
-        "--tab", tab_id,
         "--env", "A=1",
         "--env", "B=2",
         "--no-focus",
-        "--", "echo", "hi",
     ]  # fmt: skip
-    # the window id handed back is the AGENT pane, the bootstrap shell is gone,
-    # and the tab is single-pane again
-    assert pane_id == fake.agent_starts[0]["pane_id"]
+    # best-effort prompt-readiness wait, then the typed pwsh launch, then a label
+    (wait,) = _creates(fake, "pane", "wait-output")
+    assert wait == [
+        "pane", "wait-output",
+        "--regex", "PS .*>",
+        "--timeout", "10000",
+        pane_id,
+    ]  # fmt: skip
+    (pane_run,) = _creates(fake, "pane", "run")
+    assert pane_run == ["pane", "run", pane_id, "& 'echo' 'hi'; exit $LASTEXITCODE"]
+    assert fake.pane_labels[pane_id] == "win"  # `pane rename` applied the sidebar label
+    # single-pane tab, and ZERO agent verbs
+    assert not _creates(fake, "agent", "start")
+    tab_id = next(p["tab_id"] for p in fake.panes if p["pane_id"] == pane_id)
     assert [p["pane_id"] for p in fake.panes if p["tab_id"] == tab_id] == [pane_id]
-    assert not _creates(fake, "pane", "run")  # nothing typed, ever
 
 
-def test_new_window_win32_argv_roundtrip_no_shell(fake_win32):
+def test_new_window_win32_typed_launch_pwsh_quotes_argv(fake_win32):
     # The contract command string is POSIX-shlex-joined on every platform;
-    # shlex.split is its lossless inverse and agent start takes argv directly —
-    # tricky args arrive verbatim with no quoting layer at all.
+    # shlex.split is its lossless inverse, and the typed launch pwsh-quotes each
+    # element (single-quoted literals — the only quoting layer). Spaces and `&&`
+    # stay literal inside the quotes.
     fake = fake_win32
     argv = ["claude", "-p", "hello world", "--flag", "a&&b", "C:\\Users\\x y"]
     command = " ".join(shlex.quote(a) for a in argv)
     fake.add_workspace("bmad-loop-x")
-    HerdrMultiplexer().new_window("bmad-loop-x", "win", Path("/w"), {}, command)
-    assert fake.agent_starts[0]["argv"] == argv
+    pane_id = HerdrMultiplexer().new_window("bmad-loop-x", "win", Path("/w"), {}, command)
+    (pane_run,) = _creates(fake, "pane", "run")
+    expected = "& " + " ".join(herdr_backend._pwsh_quote(a) for a in argv) + "; exit $LASTEXITCODE"
+    assert pane_run == ["pane", "run", pane_id, expected]
+    assert "'hello world'" in pane_run[3]  # space survives, literal
+    assert "'a&&b'" in pane_run[3]  # `&&` survives, literal
+    assert "'C:\\Users\\x y'" in pane_run[3]
 
 
-def test_new_window_win32_window_name_target_resolves_to_agent_pane(fake_win32):
-    # After the strict bootstrap close the agent pane is the tab's FIRST (and
-    # only) pane, so "=session:window" targets resolve to the window id that
-    # new_window handed back.
+def test_new_window_win32_window_name_target_resolves_to_root_pane(fake_win32):
+    # The typed launch keeps the tab single-pane (the root pane IS the window),
+    # so "=session:window" targets resolve to the window id new_window handed back.
     fake = fake_win32
     fake.add_workspace("bmad-loop-x")
     mux = HerdrMultiplexer()
@@ -1222,48 +1188,18 @@ def test_new_window_win32_window_name_target_resolves_to_agent_pane(fake_win32):
     assert mux._parse_target("=bmad-loop-x:win", strict=True) == pane_id
 
 
-def test_new_window_win32_rolls_back_when_agent_start_fails(fake_win32, monkeypatch):
+def test_win32_prompt_wait_failure_still_launches(fake_win32):
+    # A `pane wait-output` timeout (rc=1) is swallowed — the typed launch proceeds
+    # regardless (POSIX relies on the PTY queueing input typed before the shell
+    # reads it; win32 matches that posture, with the bounded wait a mere cushion).
     fake = fake_win32
+    fake.wait_output_fails = True
     fake.add_workspace("bmad-loop-x")
-    before = {p["pane_id"] for p in fake.panes}
-    real_dispatch = fake._dispatch
-
-    def failing_agent_start(cmd, argv):
-        if argv[:2] == ["agent", "start"]:
-            return fake._server_err(cmd, "internal", "agent start exploded")
-        return real_dispatch(cmd, argv)
-
-    monkeypatch.setattr(fake, "_dispatch", failing_agent_start)
-    with pytest.raises(HerdrError):
-        HerdrMultiplexer().new_window("bmad-loop-x", "win", Path("/w"), {}, "echo hi")
-    assert {p["pane_id"] for p in fake.panes} == before  # bootstrap tab rolled back
-    assert _creates(fake, "pane", "close")  # via an explicit close, not luck
-
-
-def test_new_window_win32_rolls_back_when_shell_close_fails(fake_win32, monkeypatch):
-    # The strict bootstrap close failing must not leave a two-pane tab (each
-    # pane a phantom window): the freshly launched agent pane is killed too.
-    fake = fake_win32
-    fake.add_workspace("bmad-loop-x")
-    before = {p["pane_id"] for p in fake.panes}
-    real_dispatch = fake._dispatch
-    seen: dict[str, str] = {}
-
-    def failing_first_close(cmd, argv):
-        if argv[:2] == ["pane", "close"] and not seen:
-            seen["pane_id"] = argv[2]
-            return fake._server_err(cmd, "internal", "pane close exploded")
-        return real_dispatch(cmd, argv)
-
-    monkeypatch.setattr(fake, "_dispatch", failing_first_close)
-    with pytest.raises(HerdrError):
-        HerdrMultiplexer().new_window("bmad-loop-x", "win", Path("/w"), {}, "echo hi")
-    agent_pane = fake.agent_starts[0]["pane_id"]
-    assert agent_pane not in {p["pane_id"] for p in fake.panes}  # agent killed too
-    # the rollback's own best-effort close retries the bootstrap shell (only
-    # the STRICT close failed), so nothing the launch created survives at all
-    assert {p["pane_id"] for p in fake.panes} == before
-    assert seen["pane_id"] not in {p["pane_id"] for p in fake.panes}
+    mux = HerdrMultiplexer()
+    pane_id = mux.new_window("bmad-loop-x", "win", Path("/w"), {}, "echo hi")
+    assert _creates(fake, "pane", "wait-output")  # the wait WAS attempted...
+    (pane_run,) = _creates(fake, "pane", "run")  # ...and the launch still happened
+    assert pane_run == ["pane", "run", pane_id, "& 'echo' 'hi'; exit $LASTEXITCODE"]
 
 
 def test_new_parked_window_win32_recipe(fake_win32):
@@ -1281,53 +1217,65 @@ def test_new_parked_window_win32_recipe(fake_win32):
         "--cwd", str(Path("/work")),
         "--no-focus",
     ]  # fmt: skip
-    start = fake.agent_starts[0]
-    assert pane_id == start["pane_id"]
-    # the recipe rides agent start as pwsh argv — one element, nothing typed
-    assert start["argv"][:3] == ["pwsh", "-NoProfile", "-Command"]
-    src = start["argv"][3]
-    assert len(start["argv"]) == 4
-    assert "\n" not in src
-    assert "& 'python' '-m' 'x'; $ec=$LASTEXITCODE" in src
-    assert '"[bmad-loop exited $ec — press enter]"' in src
-    assert "Read-Host | Out-Null" in src
-    assert "$env:HERDR_PANE_ID.Replace(':','-')" in src
-    assert "-ne 'detach'" in src and "herdr tab focus $ret" in src
-    assert not _creates(fake, "pane", "run")
-    # single-pane tab, agent pane first — and the sidecar remembers the
-    # trailer's option under the AGENT pane id (the window id handed back)
-    tab_id = start["tab_id"]
+    # the recipe is TYPED into the tab's default PowerShell pane as a nested
+    # `pwsh -NoProfile -Command <recipe>`, wrapped by _typed_launch_pwsh — one
+    # `pane run`, zero agent verbs
+    (pane_run,) = _creates(fake, "pane", "run")
+    assert pane_run[:3] == ["pane", "run", pane_id]
+    typed = pane_run[3]
+    assert "\n" not in typed
+    binary = herdr_backend._pwsh_binary()
+    recipe = herdr_backend._parked_source_pwsh(["python", "-m", "x"], pane_id)
+    expected = herdr_backend._typed_launch_pwsh([binary, "-NoProfile", "-Command", recipe])
+    assert typed == expected
+    # nested-pwsh shape + the recipe embedded once as a single pwsh literal
+    assert typed.startswith(f"& {herdr_backend._pwsh_quote(binary)} '-NoProfile' '-Command' ")
+    assert typed.endswith("; exit $LASTEXITCODE")
+    assert herdr_backend._pwsh_quote(recipe) in typed
+    assert not _creates(fake, "agent", "start")
+    # single-pane tab; the label is applied; and the sidecar recorded the
+    # trailer's option under the window id BEFORE the recipe was typed (the
+    # sidecar-before-typing ordering the rollback tests below pin)
+    tab_id = next(p["tab_id"] for p in fake.panes if p["pane_id"] == pane_id)
     assert [p["pane_id"] for p in fake.panes if p["tab_id"] == tab_id] == [pane_id]
+    assert fake.pane_labels[pane_id] == "run-RID"
     state = json.loads(Path(os.environ["BMAD_LOOP_HERDR_STATE"]).read_text())
     assert state["windows"][pane_id][herdr_backend._PARKED_RETURN_KEY] == RETURN_OPTION
 
 
-def test_new_parked_window_win32_rolls_back_when_agent_start_fails(fake_win32, monkeypatch):
+def test_new_parked_window_win32_rolls_back_when_pane_run_fails(fake_win32, monkeypatch):
+    # win32's typed recipe rides `pane run` now (not agent start); a failing pane
+    # run must close the created tab and prune its sidecar entry — the exact
+    # mirror of the POSIX recipe-typing rollback.
     fake = fake_win32
     fake.add_workspace("bmad-loop-ctl")
     before = {p["pane_id"] for p in fake.panes}
     real_dispatch = fake._dispatch
+    seen: dict[str, str] = {}
 
-    def failing_agent_start(cmd, argv):
-        if argv[:2] == ["agent", "start"]:
-            return fake._server_err(cmd, "internal", "agent start exploded")
+    def failing_pane_run(cmd, argv):
+        if argv[:2] == ["pane", "run"]:
+            seen["pane_id"] = argv[2]
+            return fake._server_err(cmd, "internal", "pane run exploded")
         return real_dispatch(cmd, argv)
 
-    monkeypatch.setattr(fake, "_dispatch", failing_agent_start)
+    monkeypatch.setattr(fake, "_dispatch", failing_pane_run)
     with pytest.raises(HerdrError):
         HerdrMultiplexer().new_parked_window(
             "bmad-loop-ctl", "run-RID", Path("/w"), ["x"], RETURN_OPTION
         )
-    assert {p["pane_id"] for p in fake.panes} == before
-    assert _creates(fake, "pane", "close")
-    # agent start failed before the (post-launch) sidecar write: nothing to
-    # prune, and the tolerant loader reads the never-created file as empty
-    assert herdr_backend._load_state()["windows"] == {}
+    assert seen["pane_id"] not in before  # the launch really created a fresh pane
+    assert {p["pane_id"] for p in fake.panes} == before  # ...and rolled it back
+    assert _creates(fake, "pane", "close")  # via an explicit close, not luck
+    # the sidecar write PRECEDED the typed recipe, so the rollback prunes it too
+    state = json.loads(Path(os.environ["BMAD_LOOP_HERDR_STATE"]).read_text())
+    assert seen["pane_id"] not in state["windows"]
 
 
 def test_new_parked_window_win32_rolls_back_when_sidecar_write_fails(fake_win32, monkeypatch):
-    # The sidecar write now sits AFTER agent start (the pane id is the launch's
-    # product), so its failure must kill the already-running agent pane too.
+    # The sidecar write sits BEFORE the typed recipe now (the pane id exists at
+    # compose time), so its failure rolls the created tab back with nothing ever
+    # typed — the POSIX posture, no longer a win32 special case.
     fake = fake_win32
     fake.add_workspace("bmad-loop-ctl")
     before = {p["pane_id"] for p in fake.panes}
@@ -1340,15 +1288,15 @@ def test_new_parked_window_win32_rolls_back_when_sidecar_write_fails(fake_win32,
         HerdrMultiplexer().new_parked_window(
             "bmad-loop-ctl", "run-RID", Path("/w"), ["x"], RETURN_OPTION
         )
-    assert fake.agent_starts  # the launch really happened before the write blew
-    assert {p["pane_id"] for p in fake.panes} == before  # ...and was rolled back
+    assert {p["pane_id"] for p in fake.panes} == before  # created tab rolled back
     assert _creates(fake, "pane", "close")
+    assert not _creates(fake, "pane", "run")  # recipe never typed into a doomed tab
 
 
 def test_win32_parked_return_round_trip(fake_win32):
     # set_window_option by tmux-style name target on a win32 parked window
-    # mirrors into _return_file(agent_pane) — the same path the recipe's
-    # runtime HERDR_PANE_ID derivation produces for that pane.
+    # mirrors into _return_file(pane_id) — the same path the recipe embeds at
+    # compose time.
     fake = fake_win32
     fake.add_workspace("bmad-loop-ctl")
     mux = HerdrMultiplexer()
@@ -1358,6 +1306,20 @@ def test_win32_parked_return_round_trip(fake_win32):
     assert retfile.read_text(encoding="utf-8").strip() == "detach"
     mux.kill_window(pane_id)
     assert not retfile.exists()
+
+
+def test_win32_launch_never_uses_agent_verbs(fake_win32):
+    # The twin of test_posix_launch_never_uses_agent_start: herdr 0.7.5 has no
+    # argv-spawning agent verb, so both win32 launch surfaces stay on the typed
+    # pwsh `pane run` path and emit ZERO agent calls (the fake tripwires any
+    # `agent` verb to rc=2 for good measure).
+    fake = fake_win32
+    fake.add_workspace("bmad-loop-x")
+    mux = HerdrMultiplexer()
+    mux.new_window("bmad-loop-x", "w1n", Path("/w"), {}, "echo hi")
+    mux.new_parked_window("bmad-loop-x", "park", Path("/w"), ["x"], RETURN_OPTION)
+    assert not [c for c in fake.calls if c and c[0] == "agent"]
+    assert len(_creates(fake, "pane", "run")) == 2
 
 
 def test_win32_seam_methods_never_leak_raw_subprocess_error(boom, monkeypatch, tmp_path):
