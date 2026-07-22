@@ -56,6 +56,9 @@ class FakeHerdr:
         # screens; each read advances the cursor and sticks on the last entry.
         self.pane_reads: dict[str, list[str]] = {}
         self._pane_read_idx: dict[str, int] = {}
+        # Seedable `pane process-info` payloads: pane_id -> process_info dict
+        # (0.7.5 shape); an unseeded pane answers pane_not_found.
+        self.process_infos: dict[str, dict] = {}
         self._ws_seq = 0
         self._tab_seq: dict[str, int] = {}
         self._pane_seq: dict[str, int] = {}
@@ -121,6 +124,11 @@ class FakeHerdr:
         idx = self._pane_read_idx.get(pane_id, 0)
         self._pane_read_idx[pane_id] = idx + 1
         return screens[min(idx, len(screens) - 1)]
+
+    def set_process_info(self, pane_id: str, info: dict) -> None:
+        """Seed the ``process_info`` a ``pane process-info --pane <id>`` returns;
+        an unseeded pane answers ``pane_not_found``."""
+        self.process_infos[pane_id] = info
 
     # ---- CompletedProcess builders
 
@@ -206,6 +214,12 @@ class FakeHerdr:
             if pane is None:
                 return self._server_err(cmd, "pane_not_found", f"pane {argv[2]} not found")
             return self._ok(cmd, {"pane": pane})
+        if group == "pane" and verb == "process-info":
+            pane_id = _flag(argv, "--pane")
+            info = self.process_infos.get(pane_id)
+            if info is None:
+                return self._server_err(cmd, "pane_not_found", f"pane {pane_id} not found")
+            return self._ok(cmd, {"process_info": info})
         if group == "pane" and verb == "close":
             pane = next((p for p in self.panes if p["pane_id"] == argv[2]), None)
             self.panes = [p for p in self.panes if p["pane_id"] != argv[2]]
@@ -517,6 +531,7 @@ def test_seam_methods_never_leak_raw_subprocess_error(boom, tmp_path):
     assert mux.current_pane_id() is None
     assert mux.current_window_id() is None
     assert mux.current_session() is None
+    assert mux.window_pane_pids("w1:p1") == []
 
 
 # ------------------------------------------------------------------- sidecar
@@ -1022,6 +1037,61 @@ def test_current_accessors_none_outside_herdr(fake, monkeypatch):
     assert mux.current_session() is None
     assert mux.current_pane_id() is None
     assert mux.current_window_id() is None
+
+
+# ------------------------------------------------- bmad-loop 0.9.0 kill/return seam
+
+
+def test_window_pane_pids(fake):
+    fake.add_workspace("bmad-loop-x")
+    pane_id = fake.panes[-1]["pane_id"]
+    mux = HerdrMultiplexer()
+
+    # Seeded process-info: shell_pid leads, then each foreground pid; a pid that
+    # appears in BOTH (the shell is its own group leader) is deduped, not doubled.
+    fake.set_process_info(
+        pane_id,
+        {
+            "pane_id": pane_id,
+            "shell_pid": 4242,
+            "foreground_process_group_id": 4242,
+            "foreground_processes": [
+                {"pid": 4242, "name": "pwsh", "argv": ["pwsh"]},
+                {"pid": 4288, "name": "python", "argv": ["python", "-m", "x"]},
+            ],
+            "tty": "/dev/pts/3",
+        },
+    )
+    assert mux.window_pane_pids(pane_id) == [4242, 4288]
+
+    # shell_pid null (herdr reports no shell process) -> only the foreground pids.
+    fake.set_process_info(
+        pane_id,
+        {"pane_id": pane_id, "shell_pid": None, "foreground_processes": [{"pid": 77}]},
+    )
+    assert mux.window_pane_pids(pane_id) == [77]
+
+    # A pane herdr doesn't know answers pane_not_found -> [] ("unknown", not "none").
+    assert mux.window_pane_pids("w9:p9") == []
+
+    # Server down: the pane group errors transport-level -> [].
+    fake.running = False
+    assert mux.window_pane_pids(pane_id) == []
+
+
+def test_current_return_target_default_is_pane_id(monkeypatch):
+    # bmad-loop 0.9.0 seam: herdr DELIBERATELY inherits the default
+    # current_return_target (native pane id). herdr's one server makes a pane id
+    # unique server-wide, so it resolves from any other session's context and
+    # needs no qualification — psmux (one server PER session) overrides this;
+    # herdr must not. The absent __dict__ entry pins the no-override decision.
+    assert "current_return_target" not in HerdrMultiplexer.__dict__
+    mux = HerdrMultiplexer()
+    monkeypatch.setenv("HERDR_ENV", "1")
+    monkeypatch.setenv("HERDR_PANE_ID", "w1:p1")
+    assert mux.current_return_target() == "w1:p1"
+    monkeypatch.delenv("HERDR_ENV", raising=False)  # not inside herdr -> None
+    assert mux.current_return_target() is None
 
 
 # ------------------------------------------------ win32 launch surface (PR 3)

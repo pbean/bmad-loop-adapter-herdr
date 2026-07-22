@@ -4,8 +4,10 @@ Adapted from core's ``tests/test_backend_registry.py`` herdr section: the same
 six selection facts, re-anchored on how an OUT-OF-TREE backend registers — a
 module-level ``register_multiplexer`` call that runs at import time (directly,
 or via the ``bmad_loop.mux_backends`` entry point) — instead of core's builtin
-loader. Plus the encoder-inheritance pin from core's ``test_multiplexer.py``
-and an entry-point metadata smoke test.
+loader. Plus the encoder-inheritance pin from core's ``test_multiplexer.py``, an
+entry-point metadata smoke test, and a bmad-loop-0.9.0 fact: psmux is now a
+bundled builtin and the win32 platform default, so herdr wins on win32 only when
+psmux is absent/unavailable (or when herdr is explicitly forced).
 
 The ``fresh_registry`` fixture mirrors core's: snapshot/clear/restore the
 module-global registry, then replay this package's registration into the empty
@@ -24,6 +26,7 @@ import sys
 import pytest
 
 from bmad_loop.adapters import multiplexer as m
+from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer
 from bmad_loop.adapters.tmux_backend import TmuxMultiplexer
 
 from bmad_loop_adapter_herdr.backend import HerdrMultiplexer
@@ -103,16 +106,37 @@ def test_env_override_selects_herdr(fresh_registry, monkeypatch):
 
 def test_herdr_selected_on_win32_as_first_platform_match(fresh_registry, monkeypatch):
     """On native Windows tmux does not match (its `matches` is `p != 'win32'`) and
-    psmux is out-of-tree, so with this adapter installed the cross-platform herdr
-    is the first platform match: win32 auto-selects herdr with `_PLATFORM_DEFAULTS`
-    untouched."""
+    psmux — a bundled builtin in bmad-loop 0.9.0 and the declared win32 default —
+    has no resolvable binary here, so it probes unavailable; with this adapter
+    installed the cross-platform herdr is then the first AVAILABLE platform match:
+    win32 auto-selects herdr, `_PLATFORM_DEFAULTS` still naming psmux."""
     monkeypatch.setattr(sys, "platform", "win32")
-    monkeypatch.setattr(shutil, "which", _which_only("herdr"))  # herdr present, no tmux
+    monkeypatch.setattr(shutil, "which", _which_only("herdr"))  # herdr present, no tmux/psmux
     backend, name, reason = fresh_registry._select()
     assert isinstance(backend, HerdrMultiplexer)
     assert (name, reason) == ("herdr", "first-match")
     # sanity: _PLATFORM_DEFAULTS still names psmux for win32, not herdr
     assert fresh_registry._PLATFORM_DEFAULTS.get("win32") == "psmux"
+
+
+def test_win32_psmux_is_platform_default_when_available(fresh_registry, monkeypatch):
+    """bmad-loop 0.9.0 makes psmux a bundled builtin AND the win32 platform
+    default: with its binary (plus pwsh) resolvable and the version gate passing,
+    psmux wins as `platform-default`, AHEAD of herdr's first-match — even with
+    this adapter installed. herdr stays reachable by an explicit force."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(shutil, "which", _which_only("psmux", "pwsh", "herdr"))
+    # psmux.available() version-gates on a real `psmux -V`; stub it to a supported
+    # release (> 3.3.6) so the probe passes without spawning a subprocess.
+    monkeypatch.setattr(PsmuxMultiplexer, "version", lambda self: "tmux 3.5")
+    backend, name, reason = fresh_registry._select()
+    assert isinstance(backend, PsmuxMultiplexer)
+    assert (name, reason) == ("psmux", "platform-default")
+
+    # herdr is still selectable on win32 by explicit force, bypassing the default.
+    monkeypatch.setenv("BMAD_LOOP_MUX_BACKEND", "herdr")
+    fresh_registry.get_multiplexer.cache_clear()
+    assert isinstance(fresh_registry.get_multiplexer(), HerdrMultiplexer)
 
 
 def test_win32_falls_back_to_herdr_even_when_unavailable(fresh_registry, monkeypatch):

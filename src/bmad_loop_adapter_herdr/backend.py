@@ -76,6 +76,18 @@ the native-Windows launch):**
   another workspace flips workspace focus too — verified 0.7.3). herdr has no
   "last client" concept, so ``last_fallback`` has nothing to fall back to and
   a failed switch is honestly ``False``.
+- ``current_return_target`` (bmad-loop 0.9.0 seam) is **deliberately NOT
+  overridden**: its seam default — the native pane id — is already the right
+  token here. herdr runs ONE server for all sessions, so a pane id is unique
+  server-wide and resolves from any other session's context; psmux's
+  qualification problem (one server PER session, so a bare id is ambiguous
+  across them) simply does not arise. That default id then flows correctly
+  through ``set_window_option`` -> ``_mirror_return_value`` (pane -> tab id at
+  write time) and ``switch_client`` (``tab focus``) — the very path a parked
+  window's return option already rides. ``window_pane_pids`` (same seam) DOES
+  override the ``[]`` default: ``pane process-info`` reports the pane's shell +
+  foreground pids for core's kill escalation, degrading to ``[]`` on any
+  failure (which callers read as "unknown", never "no processes").
 - ``detach_client`` is a no-op — herdr detach is a keybinding, with no CLI
   verb. Consequence: the *post-exit* detach return is full-fidelity anyway
   (ending the parked source closes the pane, which ends a blocking ``terminal
@@ -1439,6 +1451,44 @@ class HerdrMultiplexer(TerminalMultiplexer):
             return self._client._herdr("--version")
         except (MultiplexerError, subprocess.SubprocessError, OSError):
             return None
+
+    def window_pane_pids(self, target: str) -> list[int]:
+        """Best-effort OS pids of ``target``'s pane processes, for bmad-loop
+        0.9.0's kill escalation. Overrides the seam's ``[]`` default via herdr's
+        ``pane process-info``. Sentinel discipline: NEVER raises, and returns
+        ``[]`` on ANY failure — herdr absent, the target unresolvable, the
+        server down, a transport error, or an unrecognized shape — which callers
+        read as "unknown", never as "no processes". Order is shell-first
+        (``shell_pid``) then each foreground process; ints only, deduped."""
+        if not shutil.which("herdr"):
+            return []
+        pane_id = self._parse_target(target, strict=False)
+        if pane_id is None:
+            return []
+        try:
+            proc = self._client._run(["pane", "process-info", "--pane", pane_id], check=False)
+        except (subprocess.SubprocessError, OSError):
+            return []
+        if proc.returncode != 0:
+            return []
+        try:
+            result = json.loads(proc.stdout).get("result")
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            return []
+        # 0.7.5 shape: result.process_info = {pane_id, shell_pid: int|null,
+        # foreground_process_group_id, foreground_processes: [{pid, name,…}], tty}.
+        info = result.get("process_info") if isinstance(result, dict) else None
+        if not isinstance(info, dict):
+            return []
+        candidates = [info.get("shell_pid")]
+        foreground = info.get("foreground_processes")
+        if isinstance(foreground, list):
+            candidates += [p.get("pid") for p in foreground if isinstance(p, dict)]
+        pids: list[int] = []
+        for pid in candidates:
+            if isinstance(pid, int) and not isinstance(pid, bool) and pid not in pids:
+                pids.append(pid)
+        return pids
 
 
 # --------------------------------------------------------------- parse helpers
