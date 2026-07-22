@@ -1001,11 +1001,11 @@ class HerdrMultiplexer(TerminalMultiplexer):
                 [
                     "pane",
                     "wait-output",
+                    pane_id,
                     "--regex",
                     WIN32_PROMPT_REGEX,
                     "--timeout",
                     str(WIN32_PROMPT_TIMEOUT_MS),
-                    pane_id,
                 ],
                 check=False,
             )

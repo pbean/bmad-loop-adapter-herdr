@@ -258,8 +258,13 @@ class FakeHerdr:
         if group == "pane" and verb == "wait-output":
             # win32 prompt-readiness wait: rc=1 on timeout (scriptable via
             # wait_output_fails so a test can prove the launch proceeds anyway),
-            # else ok when the pane exists.
-            pane_id = argv[-1]
+            # else ok when the pane exists. Faithful to herdr 0.7.5's CLI: the
+            # pane_id is the FIRST positional after the verb (`pane wait-output
+            # <pane_id> --regex ...`); a flag in that slot is rejected as an
+            # unknown option, so a regression to pane_id-last is caught here.
+            pane_id = argv[2] if len(argv) > 2 else ""
+            if pane_id.startswith("--"):
+                return self._server_err(cmd, "unknown_option", f"unknown option: {pane_id}")
             if self.wait_output_fails:
                 return self._server_err(cmd, "wait_output_timeout", "no match before timeout")
             if not any(p["pane_id"] == pane_id for p in self.panes):
@@ -1142,13 +1147,16 @@ def test_new_window_win32_typed_pwsh_launch(fake_win32):
         "--env", "B=2",
         "--no-focus",
     ]  # fmt: skip
-    # best-effort prompt-readiness wait, then the typed pwsh launch, then a label
+    # best-effort prompt-readiness wait, then the typed pwsh launch, then a label.
+    # pane_id is the FIRST positional after the verb, per herdr 0.7.5's CLI
+    # (`pane wait-output <pane_id> --regex ...`) — pane_id-last makes herdr reject
+    # the regex as an unknown option, silently disabling the readiness wait.
     (wait,) = _creates(fake, "pane", "wait-output")
     assert wait == [
         "pane", "wait-output",
+        pane_id,
         "--regex", "PS .*>",
         "--timeout", "10000",
-        pane_id,
     ]  # fmt: skip
     (pane_run,) = _creates(fake, "pane", "run")
     assert pane_run == ["pane", "run", pane_id, "& 'echo' 'hi'; exit $LASTEXITCODE"]
