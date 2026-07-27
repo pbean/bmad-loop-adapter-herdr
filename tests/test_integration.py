@@ -250,8 +250,10 @@ def test_herdr_pipe_pane_log_grows_under_real_pane(tmp_path, herdr_session, monk
         log_file = tmp_path / "grow.log"
         mux.pipe_pane(window_id, log_file)
 
-        # pipe_pane primes the first snapshot synchronously, so the log exists at
-        # once; wait for a later poll to append more (growth == the activity signal).
+        # pipe_pane's priming read only SEEDS the delta baseline (the pre-attach
+        # screen is never logged), so the log appears with the first line the pane
+        # renders after that; wait for a later poll to append more on top of it —
+        # growth is the activity signal.
         first_size: int | None = None
         grew = False
         deadline = time.monotonic() + 15
@@ -274,6 +276,99 @@ def test_herdr_pipe_pane_log_grows_under_real_pane(tmp_path, herdr_session, monk
         # and spin subprocess reads for the rest of the pytest worker's life.
         mux.kill_session(session)
     assert mux._pollers == {}
+
+
+def test_herdr_tee_streams_output_once_under_real_pane(tmp_path, herdr_session, monkeypatch):
+    """The tee is a stream, not a pile of frames: under a real pane each rendered
+    line lands in the log EXACTLY once, and the log stays the size of the output
+    rather than of the frames carrying it.
+
+    That is what core's two post-mortem readers assume. Re-logging every frame
+    would leave #194's 64 KiB tail reaching back seconds instead of minutes, so a
+    transport error would age out unclassified, and would inflate a file whose
+    SIZE is read as proof the CLI rendered something (#261, floor 256 bytes).
+
+    What the log may still carry from before the session's own output is the
+    shell's echo of the launch line — herdr launches by TYPING into the tab's
+    default shell, and that echo lands within milliseconds of the priming read,
+    on either side of it. Bounded by the argv's length and asserted as such here;
+    the pre-attach SCREEN, which is unbounded, is what priming keeps out."""
+    monkeypatch.setattr(herdr_backend, "POLL_INTERVAL_S", 0.25)
+    # A deliberately SLOW producer: several ticks per line, so consecutive frames
+    # always overlap and the delta alignment is exercised at its normal cadence
+    # rather than at a scroll-past-the-window edge.
+    script = write_portable_cli(
+        tmp_path,
+        "slowtalk",
+        "import time\n"
+        "for i in range(1, 6):\n"
+        '    print("TEELINE %d" % i, flush=True)\n'
+        "    time.sleep(1)\n"
+        "time.sleep(30)\n",
+    )
+
+    mux = multiplexer.get_multiplexer()
+    assert isinstance(mux, herdr_backend.HerdrMultiplexer)
+    session = "bmad-loop-tee"
+    mux.new_session(session, tmp_path)
+    try:
+        command = shlex.quote(str(script))
+        window_id = mux.new_window(session, "tee", tmp_path, {}, command)
+        log_file = tmp_path / "tee.log"
+        mux.pipe_pane(window_id, log_file)
+
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if "TEELINE 5" in (log_file.read_text(encoding="utf-8") if log_file.exists() else ""):
+                break
+            time.sleep(0.2)
+        text = log_file.read_text(encoding="utf-8")
+
+        for i in range(1, 6):
+            assert text.count(f"TEELINE {i}") == 1, f"line {i} not streamed exactly once:\n{text}"
+        # Five rendered lines, plus at most the echoed launch line and a trailing
+        # prompt. A frame-appending tee would put ~6 lines in per tick and land an
+        # order of magnitude above this; the bound is what pins "stream, not pile".
+        lines = [line for line in text.splitlines() if line.strip()]
+        assert len(lines) <= 7, f"log is carrying frames, not output:\n{text}"
+    finally:
+        mux.kill_session(session)
+
+
+def test_herdr_env_fault_classified_from_the_tee(tmp_path, herdr_session):
+    """Cross-seam, live: a CLI that prints a transport error and then idles out its
+    session clock is classified as an environment fault (bmad-loop #194) off the
+    herdr tee — so the story PAUSES for a human instead of burning a dev attempt.
+
+    Drives the real production path end to end: the pattern is the one the stock
+    `claude` profile ships, the log is the poller's, and the classification is
+    `run()`'s own post-mortem hook. The fake waits before printing so the line is
+    rendered AFTER the tee attaches — the same ordering a real API outage has, and
+    the one the seeded baseline makes load-bearing."""
+    fake = _write_fake_cli(
+        tmp_path,
+        "import time\n"
+        "time.sleep(2)\n"  # let the tee attach first: a pre-attach line is baseline
+        'print("API Error: Connection refused (ECONNREFUSED)", flush=True)\n'
+        "time.sleep(60)\n",  # idle out the session clock, exactly as the outage does
+    )
+    adapter = _make_adapter(tmp_path, profile_name="claude", binary=str(fake), extra_args=())
+    assert isinstance(adapter.mux, herdr_backend.HerdrMultiplexer)
+    assert adapter._env_fault_patterns, "the claude profile no longer seeds env_fault_patterns"
+    spec = SessionSpec(
+        task_id="t-envfault",
+        role="dev",
+        prompt="x",
+        cwd=tmp_path,
+        env={"BMAD_LOOP_RUN_DIR": str(adapter.run_dir), "BMAD_LOOP_TASK_ID": "t-envfault"},
+        timeout_s=12.0,
+    )
+    result = adapter.run(spec)
+
+    assert result.status == "timeout"
+    assert result.result_json is None
+    assert result.env_fault is True
+    assert "ECONNREFUSED" in (result.env_fault_evidence or "")
 
 
 def test_herdr_parked_window_via_start_detached(herdr_session, tmp_path):

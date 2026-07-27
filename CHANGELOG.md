@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.4.0 — unreleased
+
+Tracks bmad-loop main past 0.9.0 (pinned at `7c3615a8`), where three changes reach this
+backend. Still installs against released bmad-loop **0.9.0**: every change here is either
+backward-compatible or internal.
+
+- **`detach_client` reports effect, not dispatch (bmad-loop #227).** The seam widened from
+  `None` to `bool`, and both client verbs now owe the caller an honest answer about whether
+  a client actually moved. herdr detach is a keybinding (`ctrl+b q`) with no CLI verb, and
+  protocol 17 exposes no client/attach object to measure across the call the way psmux
+  counts its attached clients — so the answer is `False`, never a vacuous `True`. Core
+  reads that as `ReturnOutcome.UNREACHABLE`: after a sweep decision it leaves the return
+  option set for the parked trailer, prints nothing, and takes the sweep unattended
+  (pending decisions stay reachable via `bmad-loop decisions`). **From your seat the
+  visible change is that the `✓ decisions recorded` line no longer appears** — bmad-loop
+  will not announce a hand-back it could not perform. Press `ctrl+b q` as before; the
+  operator guide's detach section is rewritten around this.
+
+  `switch_client` keeps its exit-code answer, which is honest for herdr — `tab focus` fails
+  loudly on a tab that is not there. Its residue (focus moves, but a raw
+  `herdr terminal attach` client does not follow it) is recorded in the ledger; the
+  combination is unreachable through `bmad-loop attach`, which records a detach target for
+  every attach from outside herdr.
+
+  On released 0.9.0 the return value is discarded, so nothing changes there.
+
+- **The `pipe_pane` tee streams output instead of piling up frames.** The poller appended a
+  whole `pane read` snapshot on every content change; it now appends only the part of the
+  frame that is new since the previous one, and the priming read merely SEEDS that baseline
+  rather than logging the screen that was there when the tee attached. This is what tmux's
+  `pipe-pane` hands core, and two new core consumers depend on the shape: the #194 scan
+  reads the last 64 KiB of the log for a transport error (frames re-logged at ~1 Hz let a
+  real error age out of that window in seconds), and the #261 proof-of-work gate reads the
+  log's SIZE as evidence the CLI rendered anything at all (a logged pre-launch screen —
+  prompt plus typed launch line — cleared that 256-byte floor for a session that did
+  nothing). Alignment is by line overlap, with a second pass that tolerates a tail line
+  still being drawn, so a spinner costs one line per tick rather than a frame. A frame with
+  no alignment at all (alt-screen repaint, clear, or a scroll past the whole window inside
+  one tick) is still appended whole — a re-log of known text, never a loss.
+
+- **Transport failures pause the story on herdr too (bmad-loop #194), with one gap.**
+  Verified live end to end: a CLI that prints `API Error … ECONNREFUSED` and idles out its
+  session clock is classified off the herdr tee and pauses instead of burning a dev
+  attempt. The gap is inherent to polling — an error line that appears and scrolls away
+  inside one poll interval is never captured, and that story charges the attempt as it did
+  before the feature. Fail-open, and now in the operator guide's differences table.
+
+- Internal: a contract-drift guard test compares every abstract seam method's signature
+  against ours, so the next upstream widening fails a test instead of degrading silently;
+  return-file cleanup goes through `platform_util.retrying_unlink` (win32 sharing-violation
+  retry).
+
 ## 0.3.0 — 2026-07-22
 
 - **BREAKING: requires herdr ≥ 0.7.5 (server protocol 17).** The supported protocol is

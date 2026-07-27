@@ -447,6 +447,37 @@ def test_window_alive_pane_get_outcomes(fake):
         mux.window_alive("bmad-loop-x", pane_id)
 
 
+# ------------------------------------------------------------- contract drift
+#
+# This package tracks bmad-loop @main, so a seam method can be widened upstream
+# without anything here going red: Python does not check the override, and a
+# stale return type just degrades at runtime. bmad-loop #227 was exactly that —
+# `detach_client` went `None` -> `bool`, and a `None` from this backend kept
+# working while quietly meaning "nothing detached". This guard turns the next one
+# into a failing test instead.
+
+
+def test_implements_every_seam_method_with_the_seam_signature():
+    import inspect
+
+    from bmad_loop.adapters.multiplexer import TerminalMultiplexer
+
+    def sig(owner, name):
+        # Normalize whitespace only: both modules use `from __future__ import
+        # annotations`, so the annotations compare as the source strings they are.
+        return " ".join(str(inspect.signature(getattr(owner, name))).split())
+
+    drift = {}
+    for name in sorted(TerminalMultiplexer.__abstractmethods__):
+        assert not getattr(
+            getattr(HerdrMultiplexer, name), "__isabstractmethod__", False
+        ), f"HerdrMultiplexer does not implement the abstract seam method {name!r}"
+        seam, ours = sig(TerminalMultiplexer, name), sig(HerdrMultiplexer, name)
+        if seam != ours:
+            drift[name] = (seam, ours)
+    assert not drift, f"signature drift against the bmad-loop seam: {drift}"
+
+
 # ----------------------------------------------------------------- seam honesty
 #
 # No herdr contract method may leak a raw subprocess.TimeoutExpired / OSError:
@@ -494,7 +525,7 @@ def test_seam_methods_never_leak_raw_subprocess_error(boom, tmp_path):
     assert mux.select_window("w1:p1") is None
     assert mux.set_window_option("w1:p1", "opt", "v") is None
     assert mux.unset_window_option("w1:p1", "opt") is None
-    assert mux.detach_client() is None
+    assert mux.detach_client() is False
     assert mux.pipe_pane("w1:p1", tmp_path / "log") is None
     assert mux.list_sessions() == []
     assert mux.session_options("opt") == {}
@@ -703,13 +734,16 @@ def test_protocol_above_supported_warns_but_proceeds(fake):
 # --------------------------------------------------------------- degradations
 
 
-def test_pipe_pane_tolerates_dead_pane_and_detach_noop(fake, tmp_path):
+def test_pipe_pane_tolerates_dead_pane_and_detach_is_false(fake, tmp_path):
     # pipe_pane races a pane that already died on launch: the priming read gets
     # pane_not_found, so no tee thread is spun up (tmux swallows the same race).
     mux = HerdrMultiplexer()
     assert mux.pipe_pane("w9:p9", tmp_path / "log") is None
     assert mux._pollers == {}  # nothing left running
-    assert mux.detach_client() is None
+    # herdr has no detach verb and no client to measure, so the seam's honest
+    # answer is False — never a vacuous True, which would tell an attended sweep
+    # the human got their terminal back (bmad-loop #227).
+    assert mux.detach_client() is False
 
 
 # ------------------------------------------------- TUI-launch surface (PR 2)

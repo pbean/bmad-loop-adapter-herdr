@@ -48,11 +48,15 @@ bmad-loop mux set herdr  # persist the choice for this machine
 tmux remains bmad-loop's default; herdr is opt-in via `mux set herdr` or
 `BMAD_LOOP_MUX_BACKEND=herdr`. See the
 [operator guide](docs/adapter-multiplexer-herdr.md) for what changes from your seat on
-herdr (one manual detach chord, `ctrl+b q`; polled logs; a JSON state sidecar).
+herdr (one manual detach chord, `ctrl+b q`; a polled log tee; a JSON state sidecar).
 
 > **Version note:** entry-point discovery needs a bmad-loop new enough to include the
 > `bmad_loop.mux_backends` scan. On older cores the package installs fine but the
 > backend stays invisible — upgrade bmad-loop.
+>
+> Works with bmad-loop **0.9.0 and later**. Honest reporting of the mid-process
+> hand-back needs a core carrying the widened client-verb seam (bmad-loop #227): on
+> 0.9.0 the return value is discarded, so the behavior there is unchanged.
 
 ## Development
 

@@ -43,11 +43,26 @@ socket transport can replace it without touching :class:`HerdrMultiplexer`.
 the native-Windows launch):**
 
 - ``pipe_pane`` has no herdr ``pipe-pane``/tee to hand off to, so it runs a
-  per-window :class:`_PanePoller` daemon that snapshots ``pane read`` into the
-  log whenever the pane content changes (content-hash-gated — the CLI
-  ``revision`` is unusable, it stays 0). This drives the two log consumers a
-  tmux tee would: ``generic._log_activity_key`` re-arms the dev-stall grace on
-  log growth, and ``probe`` finds completion markers in the log.
+  per-window :class:`_PanePoller` daemon that polls ``pane read`` and appends the
+  part of each frame that is NEW since the previous one (:func:`_delta` — frame
+  comparison stands in for the unusable CLI ``revision``, which stays 0). The
+  priming read only SEEDS that baseline: the screen as it stood when the tee
+  attached is not this session's output, and tmux's ``pipe-pane`` does not dump
+  the existing scrollback either. What lands is therefore a stream of what the
+  session rendered, which is the shape all four log consumers assume —
+  ``generic._log_activity_key`` re-arms the dev-stall grace on log growth,
+  ``probe`` finds completion markers, ``generic._env_fault_evidence`` scans the
+  last 64 KiB for a transport failure (bmad-loop #194), and
+  ``generic._log_evidence`` reads the file's SIZE as proof the CLI rendered
+  anything at all (#261, floor 256 bytes). Three residues, all fail-open:
+  a frame with no alignment to its predecessor (an alt-screen repaint, a clear,
+  or more output than one ``recent`` window holds scrolled past inside one tick)
+  is appended whole, re-logging known text; a line that appears and scrolls away
+  between two ticks is never seen, so an ``API Error`` that brief goes
+  unclassified and the attempt is charged as it was before #194; and the shell's
+  echo of the typed launch line lands or not depending on which side of the
+  priming read it renders — bounded by the argv's length, unlike the pre-attach
+  screen the seeding keeps out.
 - ``new_parked_window`` types a POSIX ``exec sh -c '<argv>; ec=$?; echo
   <banner>; read -r _; <trailer>'`` recipe into a fresh tab, tmux-identical from
   the operator's seat. The tmux trailer reads the return option live via
@@ -77,7 +92,18 @@ the native-Windows launch):**
 - ``switch_client`` is a ``tab focus`` on the target's tab (focusing a tab in
   another workspace flips workspace focus too — verified 0.7.5). herdr has no
   "last client" concept, so ``last_fallback`` has nothing to fall back to and
-  a failed switch is honestly ``False``.
+  a failed switch is honestly ``False``. Effect vs dispatch (the seam's rule):
+  ``tab focus`` fails loudly on a tab that is not there, so its exit code does
+  mean the focus moved — no psmux-style measurement is needed on top.
+  **Residue:** what it cannot see is whether a *client* moved with the focus.
+  herdr's TUI follows focus, but a raw ``herdr terminal attach`` is bound to one
+  terminal stream and does not — so for such a client this would report an
+  effect it did not have. Unreachable through the caller that matters:
+  ``cli.cmd_attach`` records a pane target only when ``current_return_target()``
+  resolves, i.e. only from inside a herdr pane, and records ``RETURN_DETACH``
+  for every attach from outside. A headless server with nobody attached also
+  answers ``True``; there the caller goes unattended, which is correct when no
+  one is watching.
 - ``current_return_target`` (bmad-loop 0.9.0 seam) is **deliberately NOT
   overridden**: its seam default — the native pane id — is already the right
   token here. herdr runs ONE server for all sessions, so a pane id is unique
@@ -90,12 +116,21 @@ the native-Windows launch):**
   override the ``[]`` default: ``pane process-info`` reports the pane's shell +
   foreground pids for core's kill escalation, degrading to ``[]`` on any
   failure (which callers read as "unknown", never "no processes").
-- ``detach_client`` is a no-op — herdr detach is a keybinding, with no CLI
-  verb. Consequence: the *post-exit* detach return is full-fidelity anyway
-  (ending the parked source closes the pane, which ends a blocking ``terminal
-  attach`` client), but the *mid-process* ``RETURN_DETACH`` hand-back
-  (``launch.return_attached_client`` while a plain-terminal client watches)
-  degrades to "stay attached until the parked window closes".
+- ``detach_client`` answers ``False``, always — herdr detach is a keybinding
+  (``ctrl+b q``), with no CLI verb, and protocol 17 has no client/attach object
+  either, so there is nothing to dispatch AND nothing to measure the way psmux
+  counts attached clients across its exit-0 detach. ``False`` is what the seam
+  asks of that case (bmad-loop #227: report effect, never a vacuous ``True``,
+  which is the one answer that strands a human). Consequence: the *post-exit*
+  detach return is full-fidelity anyway (ending the parked source closes the
+  pane, which ends a blocking ``terminal attach`` client), but the *mid-process*
+  ``RETURN_DETACH`` hand-back (``launch.return_attached_client`` while a
+  plain-terminal client watches) degrades to "stay attached until you press the
+  chord". Core reads our ``False`` as ``ReturnOutcome.UNREACHABLE``: it leaves
+  ``RETURN_OPTION`` set for the parked trailer, prints nothing, and takes the
+  sweep unattended — which is the safe direction, since a ``--repeat`` cycle
+  prompting into a window nobody may be viewing would block on ``input()``
+  forever. Pending decisions stay reachable via ``bmad-loop decisions``.
 - Session/window **options** have no native herdr equivalent, so they live in a
   cross-process **sidecar** JSON (``~/.bmad-loop/herdr-state.json``, override
   ``BMAD_LOOP_HERDR_STATE``), written via :func:`platform_util.atomic_replace`
@@ -115,7 +150,6 @@ raisers-vs-sentinels split.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import shlex
@@ -293,8 +327,12 @@ def _write_return_file(pane_id: str, content: str) -> None:
 
 
 def _remove_return_file(pane_id: str) -> None:
+    # retrying_unlink, not a bare unlink: win32 denies a delete against an open
+    # handle exactly as it denies a rename-over, and the parked trailer may still
+    # hold this file when the window-option path clears it. Missing is fine
+    # (FileNotFoundError is an OSError) — this is a best-effort cleanup either way.
     try:
-        _return_file(pane_id).unlink()
+        platform_util.retrying_unlink(_return_file(pane_id))
     except OSError:
         pass
 
@@ -567,13 +605,69 @@ def _error_code(proc: subprocess.CompletedProcess[str]) -> str | None:
 #
 # herdr has no `pipe-pane`/tee (nor any push stream on the CLI transport), so the
 # tmux "append the pane's output to a log file" contract is emulated by polling
-# `pane read` and appending a fresh snapshot whenever the pane's content changes.
-# Two consumers read that log and MUST see it grow while a session is producing
-# output: generic._log_activity_key (mtime,size) re-arms the dev-stall grace, and
-# probe scans the log for completion markers. A #85-style no-op would leave the
-# log flat and mis-stall a long silent-but-working turn.
+# `pane read` and appending whatever is NEW since the previous read. Four
+# consumers read that log, and they want different properties of it:
+#   - generic._log_activity_key (mtime,size) re-arms the dev-stall grace, so the
+#     log must grow while the session produces output — a #85-style no-op would
+#     leave it flat and mis-stall a long silent-but-working turn;
+#   - probe scans it for completion markers, so every rendered line must land in
+#     it at least once;
+#   - generic._env_fault_evidence scans the last 64 KiB for a transport failure
+#     (bmad-loop #194) and generic._log_evidence reads its size as proof the CLI
+#     rendered anything at all (#261, floor 256 bytes) — and both of those read
+#     the log as a STREAM of what the session emitted, not as a pile of screens.
+# Hence the delta below: appending whole snapshots would satisfy the first two
+# and quietly falsify the last two.
 
 _PANE_GONE = object()  # sentinel: `pane read` was answered with pane_not_found
+
+# Upper bound on the line overlap a delta append will search for against the
+# previous frame (see _delta). herdr's `recent` window is far smaller in
+# practice; the cap is what keeps a pathological read from turning a 1 Hz tick
+# quadratic. Module-level so tests can shrink it.
+MAX_OVERLAP_LINES = 2000
+
+
+def _content_lines(text: str) -> list[str]:
+    """``text`` as lines with trailing blank ones dropped. Screen padding is not
+    content, and a padded tail would defeat every overlap match in
+    :func:`_delta` (the blanks are a suffix of the old frame that no new frame
+    starts with)."""
+    lines = text.splitlines()
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return lines
+
+
+def _delta(prev: list[str], cur: list[str]) -> list[str]:
+    """The lines of ``cur`` that ``prev`` does not already account for.
+
+    Two consecutive reads of a scrolling normal buffer overlap: the tail of the
+    older frame is the head of the newer one. That longest overlap is the
+    boundary between "already logged" and "new output", so the delta is
+    everything past it — the newly exposed lines for a scroll, the appended ones
+    for plain growth (the overlap is then the whole of ``prev``), the whole burst
+    for a burst.
+
+    The alignment is tried twice, and the second pass is the one that matters for
+    a coding CLI: a line still being drawn — a spinner, a progress counter, a
+    streaming token — mutates IN PLACE, and a mutated tail line is a suffix of
+    ``prev`` that no ``cur`` begins with, so the strict alignment finds nothing
+    and would re-log the frame every tick. Dropping ``prev``'s last line and
+    re-aligning reads that case correctly: the redraw costs one line per tick.
+    The strict pass runs first, so exact continuity always wins over the
+    something-was-mid-render reading.
+
+    No alignment at all (an alt-screen repaint, a clear, or more output than one
+    window holds scrolled past between two ticks) means the frames have no
+    established relation, so the whole of ``cur`` is the honest answer — the
+    pre-delta behavior, kept for exactly that case. It costs a re-log of text
+    already in the file, never a loss."""
+    for base in (prev, prev[:-1]):
+        for k in range(min(len(base), len(cur), MAX_OVERLAP_LINES), 0, -1):
+            if base[-k:] == cur[:k]:
+                return cur[k:]
+    return cur
 
 
 class _PanePoller(threading.Thread):
@@ -581,11 +675,19 @@ class _PanePoller(threading.Thread):
 
     Every :data:`POLL_INTERVAL_S` it reads the pane's ``recent-unwrapped`` text
     (unwrapped so herdr's narrow default width can't split a marker across lines)
-    and appends it to the log **only when the content changed** — content-hash
-    gated, because the CLI ``revision`` is unusable (it stays 0 across both
-    normal-buffer growth and alt-screen repaints; see the Phase-0 Findings). A
-    static screen therefore stops growing the log, so a genuinely idle session
-    can still stall; an actively-repainting one keeps re-arming the grace window.
+    and appends **only the lines that are new** since the previous read
+    (:func:`_delta`). Frame comparison replaces the unusable CLI ``revision``,
+    which stays 0 across both normal-buffer growth and alt-screen repaints (see
+    the Phase-0 Findings). A static screen therefore stops growing the log, so a
+    genuinely idle session can still stall; an actively-repainting one keeps
+    re-arming the grace window.
+
+    Appending the delta rather than the frame is what makes the log a stream of
+    what the session emitted — the shape tmux's ``pipe-pane`` hands core, and the
+    shape both of core's post-mortem readers assume. A whole-frame append would
+    leave the file dominated by re-renders, so #194's 64 KiB tail would reach
+    back seconds instead of minutes and a transport error would age out of it
+    unclassified.
 
     Retired by :meth:`stop` (kill_window / kill_session) or, on its own, after
     :data:`POLL_NOT_FOUND_LIMIT` consecutive server-answered ``pane_not_found``
@@ -612,7 +714,9 @@ class _PanePoller(threading.Thread):
         self._interval_s = POLL_INTERVAL_S if interval_s is None else interval_s
         self._not_found_limit = POLL_NOT_FOUND_LIMIT if not_found_limit is None else not_found_limit
         self._stop_event = threading.Event()
-        self._last_hash: str | None = None
+        # The previous frame's content lines — the delta baseline, seeded by
+        # prime() and advanced by every recorded read. None only before priming.
+        self._prev: list[str] | None = None
 
     def stop(self) -> None:
         """Signal the thread to exit. Returns immediately: the event wakes the
@@ -621,14 +725,23 @@ class _PanePoller(threading.Thread):
         self._stop_event.set()
 
     def prime(self) -> bool:
-        """Do one synchronous read before the thread starts. Returns True (and
-        logs the first snapshot) if the pane answered with text; False if it is
+        """Do one synchronous read before the thread starts, seeding the delta
+        baseline. Returns True if the pane answered with text; False if it is
         already gone or unreachable — the caller then declines to spin up a
         thread, which is how :meth:`HerdrMultiplexer.pipe_pane` stays tolerant of
-        a pane that died on launch (probe.py depends on that tolerance)."""
+        a pane that died on launch (probe.py depends on that tolerance).
+
+        The seeded frame is deliberately NOT logged. It is the screen as it stood
+        when the tee attached — the shell prompt and the launch line typed into
+        it — which the session did not render; tmux's ``pipe-pane`` likewise tees
+        from the moment it attaches and never dumps the existing scrollback.
+        Logging it would also put a few hundred bytes of prompt into a file whose
+        SIZE core reads as proof this session rendered something at all
+        (``PROOF_OF_WORK_MIN_LOG_BYTES``, #261), turning a wedged CLI's empty log
+        into a passing one."""
         snapshot = self._read_snapshot()
         if isinstance(snapshot, str):
-            self._record(snapshot)
+            self._prev = _content_lines(snapshot)
             return True
         return False
 
@@ -665,12 +778,13 @@ class _PanePoller(threading.Thread):
         return None  # non-JSON `Error: Os` etc. — unreachable, retry next tick
 
     def _record(self, text: str) -> None:
-        digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
-        if digest == self._last_hash:
+        lines = _content_lines(text)
+        if lines == self._prev:
             return  # unchanged screen: not activity, don't grow the log
-        self._last_hash = digest
-        if text.strip():  # a blank repaint isn't worth a log line
-            self._append(text)
+        fresh = lines if self._prev is None else _delta(self._prev, lines)
+        self._prev = lines
+        if any(line.strip() for line in fresh):  # a blank repaint isn't a log line
+            self._append("\n".join(fresh))
 
     def _append(self, text: str) -> None:
         # Append-only so the log's inode/size grow monotonically (the activity
@@ -1388,9 +1502,17 @@ class HerdrMultiplexer(TerminalMultiplexer):
         value = os.environ.get(key)
         return value or None
 
-    def detach_client(self) -> None:
-        # herdr detach is a keybinding, with no CLI verb — documented no-op.
-        return None
+    def detach_client(self) -> bool:
+        # Effect, not dispatch: False, always. herdr detach is a keybinding
+        # (`ctrl+b q`) with no CLI verb, so nothing is dispatched — and there is
+        # nothing to measure either, the way psmux counts a session's attached
+        # clients across its exit-0 detach: protocol 17 has no client/attach
+        # object at all, so no probe can answer "did somebody leave". False is
+        # what the widened seam wants for that case; a vacuous True is the one
+        # answer that strands a human (bmad-loop #227), and it reaches the caller
+        # as RETURN_DETACH -> UNREACHABLE, so an attended sweep stops prompting
+        # into a window only a manual chord can release.
+        return False
 
     def switch_client(self, target: str, last_fallback: bool = False) -> bool:
         # The herdr "switch client" move is a tab focus: focusing a tab also
