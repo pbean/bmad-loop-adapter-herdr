@@ -54,15 +54,19 @@ the native-Windows launch):**
   ``probe`` finds completion markers, ``generic._env_fault_evidence`` scans the
   last 64 KiB for a transport failure (bmad-loop #194), and
   ``generic._log_evidence`` reads the file's SIZE as proof the CLI rendered
-  anything at all (#261, floor 256 bytes). Three residues, all fail-open:
-  a frame with no alignment to its predecessor (an alt-screen repaint, a clear,
-  or more output than one ``recent`` window holds scrolled past inside one tick)
-  is appended whole, re-logging known text; a line that appears and scrolls away
-  between two ticks is never seen, so an ``API Error`` that brief goes
-  unclassified and the attempt is charged as it was before #194; and the shell's
-  echo of the typed launch line lands or not depending on which side of the
-  priming read it renders — bounded by the argv's length, unlike the pre-attach
-  screen the seeding keeps out.
+  anything at all (#261, floor 256 bytes). Because the launch is TYPED into a
+  shell here (tmux runs it as the pane's process), the shell renders it back, and
+  that text is ours rather than the session's: it is filtered out of the deltas
+  (:meth:`_PanePoller._strip_launch_echo`) on the same reasoning that keeps the
+  primed frame out. Left unsuppressed it cleared the #261 floor by itself on
+  win32 — 306 bytes of prompt, binary path and prompt argv, measured — which
+  would read a session that rendered nothing as one that worked. Two residues
+  remain, both fail-open: a frame with no alignment to its predecessor (an
+  alt-screen repaint, a clear, or more output than one ``recent`` window holds
+  scrolled past inside one tick) is appended whole, re-logging known text; and a
+  line that appears and scrolls away between two ticks is never seen, so an
+  ``API Error`` that brief goes unclassified and the attempt is charged as it was
+  before #194.
 - ``new_parked_window`` types a POSIX ``exec sh -c '<argv>; ec=$?; echo
   <banner>; read -r _; <trailer>'`` recipe into a fresh tab, tmux-identical from
   the operator's seat. The tmux trailer reads the return option live via
@@ -670,6 +674,21 @@ def _delta(prev: list[str], cur: list[str]) -> list[str]:
     return cur
 
 
+def _is_launch_echo(line: str, launch_line: str | None) -> bool:
+    """Whether ``line`` is the shell rendering back the launch WE typed.
+
+    The launch is typed into the tab's default shell (``pane run``), so the shell
+    paints it — and that text is not this session's output any more than the
+    pre-attach screen is. Matching is containment rather than equality because
+    the shell's echo carries its prompt as a prefix (``❯ `` on POSIX, ``PS
+    <cwd>> `` on win32) while the raw paint that precedes it does not, and frames
+    are read ``recent-unwrapped`` so neither is ever split across two lines. A
+    truncated or re-rendered copy simply fails to match and lands in the log —
+    the pre-fix behavior, which costs a re-log of known text, never a loss."""
+    needle = (launch_line or "").strip()
+    return bool(needle) and needle in line
+
+
 class _PanePoller(threading.Thread):
     """A daemon thread that tees one herdr pane into a log file by polling.
 
@@ -704,11 +723,17 @@ class _PanePoller(threading.Thread):
         *,
         interval_s: float | None = None,
         not_found_limit: int | None = None,
+        launch_line: str | None = None,
     ) -> None:
         super().__init__(daemon=True, name=f"herdr-poll-{pane_id}")
         self._client = client
         self._pane_id = pane_id
         self._log_file = Path(log_file)
+        # The line new_window typed into this pane's shell, so its echo can be
+        # kept out of the log (see _launch_echo_index and _strip_launch_echo).
+        # None for a tee over a pane this backend did not launch.
+        self._launch_line = launch_line
+        self._echo_armed = launch_line is not None
         # Resolve the cadence from the module globals at construction (not as
         # signature defaults) so a test can shrink POLL_* before starting one.
         self._interval_s = POLL_INTERVAL_S if interval_s is None else interval_s
@@ -738,7 +763,14 @@ class _PanePoller(threading.Thread):
         Logging it would also put a few hundred bytes of prompt into a file whose
         SIZE core reads as proof this session rendered something at all
         (``PROOF_OF_WORK_MIN_LOG_BYTES``, #261), turning a wedged CLI's empty log
-        into a passing one."""
+        into a passing one.
+
+        Finding the launch line on the primed frame is NOT a reason to disarm the
+        echo suppression: ``pane run`` paints the typed text before the shell has
+        drawn its prompt, so the same command renders twice — once raw (often what
+        this read catches) and again as the shell's prompt-prefixed echo, a
+        distinct line the next delta would otherwise log. Seeding excludes only
+        the copy it saw; :meth:`_strip_launch_echo` owns every later one."""
         snapshot = self._read_snapshot()
         if isinstance(snapshot, str):
             self._prev = _content_lines(snapshot)
@@ -783,8 +815,46 @@ class _PanePoller(threading.Thread):
             return  # unchanged screen: not activity, don't grow the log
         fresh = lines if self._prev is None else _delta(self._prev, lines)
         self._prev = lines
+        if self._echo_armed:
+            fresh = self._strip_launch_echo(fresh)
         if any(line.strip() for line in fresh):  # a blank repaint isn't a log line
             self._append("\n".join(fresh))
+
+    def _strip_launch_echo(self, fresh: list[str]) -> list[str]:
+        """Drop every rendering of our typed launch from the delta ``fresh``.
+
+        The baseline keeps the pre-attach screen out of the log, but the launch
+        line is typed just before the tee attaches and its echo usually renders
+        just after — landing in the first delta as the one thing in this file the
+        session did not emit. Core reads the file's SIZE as proof the CLI rendered
+        anything at all (#261, floor 256 bytes) and states the floor measures the
+        CLI's OWN output; on this backend the echo is prompt + binary path + the
+        whole prompt argv, which on win32 measured 306 bytes against that floor —
+        enough for a session that rendered nothing to read as one that worked, the
+        exact upgrade #261 exists to refuse. tmux has no equivalent because there
+        the launch is the pane's process, not a line typed into a shell.
+
+        Every matching line in the delta goes, not just the first, and a match does
+        NOT disarm: ``pane run`` paints the typed text before the shell draws its
+        prompt, so the launch renders twice — raw, then prompt-prefixed — and those
+        are two different lines that can fall on either side of the priming read
+        (measured live: the raw copy seeded the baseline and the echo was the whole
+        of the first delta). Disarming on the first would just re-admit the second.
+
+        What bounds it instead is the only causally sound rule: a shell echoes what
+        it was told to run BEFORE the program it runs can print anything, so the
+        suppression retires the moment any OTHER content reaches the log. A session
+        that renders nothing leaves it armed for good, which costs nothing — there
+        are no lines to drop. The residue is a CLI whose very first rendered line
+        quotes our whole launch back at us; that one line is dropped, which errs
+        toward an empty log, the direction #261 wants.
+
+        Only the delta is filtered — ``_prev`` keeps the full frame, or the next
+        read would find the echo unaccounted for and log it after all."""
+        kept = [line for line in fresh if not _is_launch_echo(line, self._launch_line)]
+        if any(line.strip() for line in kept):
+            self._echo_armed = False
+        return kept
 
     def _append(self, text: str) -> None:
         # Append-only so the log's inode/size grow monotonically (the activity
@@ -813,6 +883,12 @@ class HerdrMultiplexer(TerminalMultiplexer):
         # only from the caller's thread (pipe_pane / kill_*); the poller threads
         # never touch it. The lock is defensive hygiene, not a hot path.
         self._pollers: dict[str, _PanePoller] = {}
+        # The launch line new_window typed into each pane, keyed the same way, so
+        # pipe_pane can tell a tee which one line on screen is the shell's echo of
+        # our own keystrokes rather than session output. Written by new_window,
+        # read by pipe_pane, dropped when the window's tee is retired — same
+        # single-threaded caller, same lock.
+        self._launch_lines: dict[str, str] = {}
         self._pollers_lock = threading.Lock()
 
     # -------------------------------------------------- enumeration helpers
@@ -1088,18 +1164,27 @@ class HerdrMultiplexer(TerminalMultiplexer):
             # (bootstrap shell + agent pane) is structurally gone; there is only
             # ever the tab's one root pane.
             self._await_shell_prompt(pane_id)
-            self._client._herdr("pane", "run", pane_id, _typed_launch_pwsh(argv))
+            launch_line = _typed_launch_pwsh(argv)
+            self._client._herdr("pane", "run", pane_id, launch_line)
             self._label_pane(pane_id, name)
         else:
-            self._launch(pane_id, argv)
+            launch_line = self._launch(pane_id, argv)
+        # Remembered for pipe_pane: the shell echoes what we just typed, and that
+        # echo is ours, not the session's (see _PanePoller._strip_launch_echo).
+        # Recorded after the launch so a failed one leaves no stale entry.
+        with self._pollers_lock:
+            self._launch_lines[pane_id] = launch_line
         return pane_id
 
-    def _launch(self, pane_id: str, argv: list[str]) -> None:
+    def _launch(self, pane_id: str, argv: list[str]) -> str:
         # `pane run` types the line and presses Enter atomically. `exec` replaces
         # the shell so the process IS the pane; POSIX-only by design — win32
         # types _typed_launch_pwsh's `& <argv>; exit $LASTEXITCODE` instead
         # (there is no POSIX `exec`, and the default shell's dialect is pwsh).
-        self._client._herdr("pane", "run", pane_id, "exec " + shlex.join(argv))
+        # Returns the typed line so new_window can hand it to the tee.
+        line = "exec " + shlex.join(argv)
+        self._client._herdr("pane", "run", pane_id, line)
+        return line
 
     def _await_shell_prompt(self, pane_id: str) -> None:
         # Best-effort readiness wait before a win32 typed launch: block until the
@@ -1409,7 +1494,9 @@ class HerdrMultiplexer(TerminalMultiplexer):
         # then reported as a crash by wait_for_completion.
         if not shutil.which("herdr"):
             return None
-        poller = _PanePoller(self._client, window_id, Path(log_file))
+        with self._pollers_lock:
+            launch_line = self._launch_lines.get(window_id)
+        poller = _PanePoller(self._client, window_id, Path(log_file), launch_line=launch_line)
         if not poller.prime():
             return None
         with self._pollers_lock:
@@ -1423,6 +1510,7 @@ class HerdrMultiplexer(TerminalMultiplexer):
     def _stop_poller(self, window_id: str) -> None:
         with self._pollers_lock:
             poller = self._pollers.pop(window_id, None)
+            self._launch_lines.pop(window_id, None)
         if poller is not None:
             poller.stop()
 
@@ -1433,6 +1521,8 @@ class HerdrMultiplexer(TerminalMultiplexer):
         with self._pollers_lock:
             doomed = [pid for pid in self._pollers if pid.split(":", 1)[0] == workspace_id]
             pollers = [self._pollers.pop(pid) for pid in doomed]
+            for pid in [p for p in self._launch_lines if p.split(":", 1)[0] == workspace_id]:
+                self._launch_lines.pop(pid, None)
         for poller in pollers:
             poller.stop()
 

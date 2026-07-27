@@ -40,6 +40,23 @@ backward-compatible or internal.
   no alignment at all (alt-screen repaint, clear, or a scroll past the whole window inside
   one tick) is still appended whole — a re-log of known text, never a loss.
 
+- **The shell's echo of the launch line is filtered out of the tee.** This backend TYPES
+  the launch into the tab's default shell (tmux runs it as the pane's process), so the
+  shell echoes it back onto the screen — and that echo was the one thing in the log the CLI
+  had not rendered. It defeated the #261 proof-of-work gate outright: measured on the
+  Windows VM, a session that rendered *nothing* left a 306-byte log (prompt, binary path
+  and the whole prompt argv), clearing core's 256-byte floor and letting a dead-on-arrival
+  session's read-back artifact upgrade to `completed` — the exact upgrade #261 exists to
+  refuse. On POSIX the same echo measured 161 bytes, under the floor by path length rather
+  than by design. `new_window` now hands the tee the line it typed, and the poller drops it
+  from the deltas. Priming alone could not do it: `pane run` paints the typed text before
+  the shell draws its prompt, so the launch renders *twice* — raw, then prompt-prefixed —
+  on either side of the priming read (measured live). The suppression therefore retires on
+  the first OTHER content to reach the log, which is sound because a shell echoes what it
+  was told to run before that program can print anything. Verified live on both halves: a
+  do-nothing session now logs 0 bytes, and a rendering one still streams every line exactly
+  once, `API Error … ECONNREFUSED` included.
+
 - **Transport failures pause the story on herdr too (bmad-loop #194), with one gap.**
   Verified live end to end: a CLI that prints `API Error … ECONNREFUSED` and idles out its
   session clock is classified off the herdr tee and pauses instead of burning a dev

@@ -377,3 +377,147 @@ def test_no_herdr_poll_threads_leak(fake, tmp_path):
 def _live_poll_threads(pane_id: str) -> list[threading.Thread]:
     name = f"herdr-poll-{pane_id}"
     return [t for t in threading.enumerate() if t.name == name and t.is_alive()]
+
+
+# ------------------------------------------------- the typed launch line's echo
+#
+# This backend TYPES the launch into the tab's default shell (tmux runs it as the
+# pane's process), so the shell echoes it back onto the screen. That echo is ours,
+# not the session's, and it lands one tick after the priming read that was meant to
+# keep the pre-attach screen out — putting the one thing in the log the CLI did not
+# render into the file whose SIZE core reads as proof the CLI rendered something
+# (#261, floor 256 bytes).
+
+# The win32 launch as MEASURED on the Windows VM (the E2E's sandbox under the
+# pytest temp root): the pane's cwd appears twice — once as the PowerShell prompt,
+# once as the binary's absolute path — which is how the echo alone reached 306
+# bytes against core's 256-byte floor. Kept verbatim rather than shortened: the
+# whole point is that argv length is not bounded below the floor.
+_WIN32_CWD = r"C:\Users\pj_be\AppData\Local\Temp\pytest-of-pj_be\pytest-6\test_herdr_e2e_two_story_happy0\sbx"
+_WIN32_CLI = _WIN32_CWD + r"\.bmad-loop\fake-cli.cmd"
+_PROMPT_ARG = "/bmad-dev-auto Spec folder: _bmad-output/epic-1. Story id: 2."
+_POSIX_ECHO = "❯ exec /home/dev/.local/bin/claude '/bmad-dev-auto Story id: 2.'"
+
+
+def test_launch_echo_is_kept_out_of_the_log(fake, tmp_path):
+    # The echo renders on the tick AFTER priming (the common case: the shell had
+    # not echoed yet when the tee attached). It must not reach the log; the CLI's
+    # own first line, in that same delta, must.
+    fake.add_workspace("bmad-loop-x")
+    pane = fake.panes[-1]["pane_id"]
+    log = tmp_path / "t.log"
+    fake.set_pane_reads(pane, ["❯ \n", f"{_POSIX_ECHO}\nWelcome to Claude Code\n"])
+
+    poller = herdr_backend._PanePoller(
+        herdr_backend._HerdrClient(),
+        pane,
+        log,
+        interval_s=1,
+        not_found_limit=2,
+        launch_line="exec /home/dev/.local/bin/claude '/bmad-dev-auto Story id: 2.'",
+    )
+    assert poller.prime() is True
+    poller._record(poller._read_snapshot())
+
+    assert log.read_text(encoding="utf-8") == "Welcome to Claude Code\n"
+
+
+def test_launch_renders_twice_and_neither_copy_is_logged(fake, tmp_path):
+    # The sequence MEASURED against a live herdr server: `pane run` paints the
+    # typed text into the pane before the shell has drawn its prompt, so the launch
+    # appears twice — once raw (which the priming read catches, making it baseline)
+    # and once prompt-prefixed, as the shell's real echo, which lands as the whole
+    # of the first delta. Finding the first copy must NOT disarm the suppression,
+    # or the second walks straight into the log (103 bytes, measured, for a session
+    # that had rendered nothing at all).
+    fake.add_workspace("bmad-loop-x")
+    pane = fake.panes[-1]["pane_id"]
+    log = tmp_path / "t.log"
+    launch = "exec /home/dev/.local/bin/claude '/bmad-dev-auto Story id: 2.'"
+    fake.set_pane_reads(pane, [f"{launch}\n", f"{launch}\n❯ {launch}\n", f"{launch}\n❯ {launch}\n"])
+
+    poller = herdr_backend._PanePoller(
+        herdr_backend._HerdrClient(), pane, log, interval_s=1, not_found_limit=2, launch_line=launch
+    )
+    assert poller.prime() is True
+    assert poller._echo_armed is True  # the raw copy is not the shell's echo
+    poller._record(poller._read_snapshot())
+    poller._record(poller._read_snapshot())
+
+    assert not log.exists()  # nothing rendered by the session -> nothing logged
+
+
+def test_launch_echo_suppression_disarms_once_output_lands(fake, tmp_path):
+    # A shell echoes what it was told to run BEFORE the program it runs can print
+    # anything, so once real output reaches the log the echo is never coming. The
+    # suppression must disarm there too — an armed filter that outlives its window
+    # is one that can silently drop a real line much later in the session.
+    fake.add_workspace("bmad-loop-x")
+    pane = fake.panes[-1]["pane_id"]
+    log = tmp_path / "t.log"
+    launch = "exec /home/dev/.local/bin/claude '/bmad-dev-auto Story id: 2.'"
+    fake.set_pane_reads(
+        pane,
+        [
+            "❯ \n",
+            "❯ \nfirst real line\n",  # echo never observed (scrolled inside a tick)
+            f"❯ \nfirst real line\nre-running {launch}\n",
+        ],
+    )
+
+    poller = herdr_backend._PanePoller(
+        herdr_backend._HerdrClient(), pane, log, interval_s=1, not_found_limit=2, launch_line=launch
+    )
+    assert poller.prime() is True
+    poller._record(poller._read_snapshot())
+    assert poller._echo_armed is False
+    poller._record(poller._read_snapshot())
+
+    assert log.read_text(encoding="utf-8") == f"first real line\nre-running {launch}\n"
+
+
+def test_win32_launch_echo_alone_stays_under_the_proof_of_work_floor(fake, tmp_path, monkeypatch):
+    # The #261 regression, end to end on the surface that had it: new_window types
+    # the pwsh launch, pipe_pane tees the pane, and the session renders NOTHING —
+    # the pane only ever shows the prompt and the echo of what we typed. The log
+    # must stay under core's 256-byte proof-of-work floor, or a dead-on-arrival
+    # session reads as one that produced work and its read-back artifact gets
+    # upgraded to `completed`.
+    import shlex
+
+    monkeypatch.setattr(herdr_backend, "_is_win32", lambda: True)
+    fake.add_workspace("bmad-loop-x")
+    mux = HerdrMultiplexer()
+    command = shlex.join([_WIN32_CLI, _PROMPT_ARG])
+    pane = mux.new_window("bmad-loop-x", "2-dev-1", Path("/proj"), {}, command)
+
+    prompt = f"PS {_WIN32_CWD}> "
+    echo = prompt + herdr_backend._typed_launch_pwsh([_WIN32_CLI, _PROMPT_ARG])
+    assert len(echo.encode()) + 1 == 306  # the premise: this echo alone cleared the floor
+    fake.set_pane_reads(pane, [f"{prompt}\n", f"{echo}\n", f"{echo}\n"])
+
+    log = tmp_path / "logs" / "2-dev-1.log"
+    try:
+        mux.pipe_pane(pane, log)
+        # Wait on the tee having SEEN the echo frame (true with or without the
+        # suppression), so what the size assertion below measures is the defect.
+        assert _wait_until(lambda: echo in "\n".join(mux._pollers[pane]._prev or []))
+    finally:
+        _stop_all(mux)
+
+    size = log.stat().st_size if log.exists() else 0
+    assert size == 0  # nothing rendered -> nothing logged
+    assert size <= 256  # what generic._log_evidence actually compares
+
+
+def test_launch_line_is_dropped_when_the_window_dies(fake, tmp_path, monkeypatch):
+    # The launch-line map is per-window state; a run drives many windows, so it has
+    # to be freed on teardown rather than grow for the life of the process.
+    monkeypatch.setattr(herdr_backend, "_is_win32", lambda: False)
+    fake.add_workspace("bmad-loop-x")
+    mux = HerdrMultiplexer()
+    pane = mux.new_window("bmad-loop-x", "win", Path("/proj"), {}, "claude hi")
+    assert mux._launch_lines[pane] == "exec claude hi"
+
+    mux.kill_window(pane)
+    assert pane not in mux._launch_lines
