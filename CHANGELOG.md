@@ -64,6 +64,14 @@ backward-compatible or internal.
   inside one poll interval is never captured, and that story charges the attempt as it did
   before the feature. Fail-open, and now in the operator guide's differences table.
 
+- **A failed `pane close` / `workspace close` now says so.** `kill_window` and
+  `kill_session` ran the close with its result discarded, so a pane that outlived its
+  close stayed alive and unwatched with nothing on record. Both now warn on stderr, naming
+  the pane or workspace id and the error, on a nonzero exit, timeout or spawn fault, as
+  core's tmux `kill_window` does. An already-gone target (`pane_not_found` /
+  `workspace_not_found`) is ordinary teardown and stays silent. Teardown still never
+  raises, and the sidecar cleanup runs either way.
+
 - Internal: a contract-drift guard test compares every abstract seam method's signature
   against ours, so the next upstream widening fails a test instead of degrading silently;
   return-file cleanup goes through `platform_util.retrying_unlink` (win32 sharing-violation
