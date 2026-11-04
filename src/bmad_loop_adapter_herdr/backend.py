@@ -1062,10 +1062,10 @@ class HerdrMultiplexer(TerminalMultiplexer):
         if shutil.which("herdr"):
             try:
                 wid = self._workspace_id(name, strict=False)
-                if wid is not None:
-                    self._client._run(["workspace", "close", wid], check=False)
             except (subprocess.SubprocessError, OSError):
                 wid = None
+            if wid is not None:
+                self._close_loudly("workspace", wid, "workspace_not_found")
         if wid is not None:
             self._stop_pollers_for_workspace(wid)
             _drop_windows_for_workspace(wid)
@@ -1386,12 +1386,35 @@ class HerdrMultiplexer(TerminalMultiplexer):
             return
         self._stop_poller(pane_id)
         if shutil.which("herdr"):
-            try:
-                self._client._run(["pane", "close", pane_id], check=False)
-            except (subprocess.SubprocessError, OSError):
-                pass
+            self._close_loudly("pane", pane_id, "pane_not_found")
         _drop_state("windows", pane_id)
         _remove_return_file(pane_id)
+
+    def _close_loudly(self, kind: str, ident: str, gone_code: str) -> None:
+        """Run ``herdr <kind> close <ident>`` best-effort, but say so on stderr
+        when it fails — the tmux twin's ``kill_window`` warning.
+
+        Teardown never raises and the caller's state cleanup runs either way: a
+        failed close is no reason to keep tracking a window bmad-loop is done
+        with. But a pane or workspace that outlives its close is alive and no
+        longer watched, so the failure must be visible rather than swallowed.
+        A close the server answers with ``gone_code`` is ordinary teardown (the
+        session ended by window death, or a CLI raced its window down at
+        launch) and stays silent; any other non-zero exit, a timeout or a spawn
+        fault warns, naming the id and the error."""
+        try:
+            proc = self._client._run([kind, "close", ident], check=False)
+        except (subprocess.SubprocessError, OSError) as e:
+            detail = f"{type(e).__name__}: {e}"
+        else:
+            if proc.returncode == 0 or _error_code(proc) == gone_code:
+                return
+            stderr = (proc.stderr or "").strip()
+            detail = f"exited {proc.returncode}{f': {stderr}' if stderr else ''}"
+        print(
+            f"warning: herdr {kind} close {ident} failed ({detail}); it may still be alive",
+            file=sys.stderr,
+        )
 
     def select_window(self, target: str) -> None:
         # Best-effort focus: resolve the pane's tab and focus it (herdr has

@@ -671,6 +671,92 @@ def test_kill_session_closes_workspace_and_prunes_sidecar(fake):
     assert "bmad-loop-x" not in state["sessions"]
 
 
+def _failing_close(fake, monkeypatch, kind: str, outcome):
+    """Make every ``herdr <kind> close`` answer ``outcome``: a server error code
+    (nonzero exit, nested JSON body), a transport error (non-JSON stderr), or an
+    exception instance the spawn raises. The fake's own state is left as is, so
+    the pane/workspace a failed close names is still listed afterwards."""
+    real = fake._dispatch
+
+    def dispatch(cmd, argv):
+        if argv[:2] == [kind, "close"]:
+            if isinstance(outcome, BaseException):
+                raise outcome
+            if outcome == "transport":
+                return fake._cp(cmd, 1, err="error: connection refused")
+            return fake._server_err(cmd, outcome, f"{kind} close: {outcome}")
+        return real(cmd, argv)
+
+    monkeypatch.setattr(fake, "_dispatch", dispatch)
+
+
+@pytest.mark.parametrize(
+    "outcome, shown",
+    [
+        ("internal_error", "exited 1"),
+        ("transport", "connection refused"),
+        (subprocess.TimeoutExpired(["herdr"], 5), "TimeoutExpired"),
+        (OSError("spawn failed"), "OSError: spawn failed"),
+    ],
+)
+def test_kill_window_warns_when_the_pane_close_fails(fake, monkeypatch, capsys, outcome, shown):
+    """A pane that outlives its close is alive and unwatched: say so, naming
+    the pane and the error — and still drop the sidecar entry and return None.
+    Ablation: swallow the close result (the old `check=False` + `pass`) and
+    nothing is printed."""
+    fake.add_workspace("bmad-loop-x")
+    pane_id = fake.panes[-1]["pane_id"]
+    mux = HerdrMultiplexer()
+    mux.set_window_option(pane_id, "opt", "v")
+    _failing_close(fake, monkeypatch, "pane", outcome)
+    assert mux.kill_window(pane_id) is None
+    err = capsys.readouterr().err
+    assert f"warning: herdr pane close {pane_id} failed (" in err
+    assert shown in err
+    assert mux.show_window_option(pane_id, "opt") == ""  # cleanup is unconditional
+
+
+def test_kill_window_is_silent_when_the_pane_is_already_gone(fake, monkeypatch, capsys):
+    """`pane_not_found` is ordinary teardown (a session that ended by window
+    death has nothing left to close), so it must not warn.
+    Ablation: warn on every nonzero exit and this fails."""
+    fake.add_workspace("bmad-loop-x")
+    pane_id = fake.panes[-1]["pane_id"]
+    _failing_close(fake, monkeypatch, "pane", "pane_not_found")
+    HerdrMultiplexer().kill_window(pane_id)
+    assert capsys.readouterr().err == ""
+
+
+def test_kill_window_and_session_are_silent_on_success(fake, capsys):
+    fake.add_workspace("bmad-loop-x")
+    mux = HerdrMultiplexer()
+    mux.kill_window(fake.panes[-1]["pane_id"])
+    mux.kill_session("bmad-loop-x")
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize("outcome", ["internal_error", subprocess.TimeoutExpired(["herdr"], 5)])
+def test_kill_session_warns_when_the_workspace_close_fails(fake, monkeypatch, capsys, outcome):
+    """The workspace twin: warn naming the workspace id, and still retire the
+    session's sidecar state.
+    Ablation: swallow the close result and nothing is printed."""
+    wid = fake.add_workspace("bmad-loop-x")
+    mux = HerdrMultiplexer()
+    mux.set_session_option("bmad-loop-x", PROJECT_OPTION, "/proj")
+    _failing_close(fake, monkeypatch, "workspace", outcome)
+    assert mux.kill_session("bmad-loop-x") is None
+    assert f"warning: herdr workspace close {wid} failed (" in capsys.readouterr().err
+    state = json.loads(Path(os.environ["BMAD_LOOP_HERDR_STATE"]).read_text())
+    assert "bmad-loop-x" not in state["sessions"]
+
+
+def test_kill_session_is_silent_when_the_workspace_is_already_gone(fake, monkeypatch, capsys):
+    fake.add_workspace("bmad-loop-x")
+    _failing_close(fake, monkeypatch, "workspace", "workspace_not_found")
+    HerdrMultiplexer().kill_session("bmad-loop-x")
+    assert capsys.readouterr().err == ""
+
+
 def test_kill_session_tolerates_missing_binary(monkeypatch, tmp_path):
     monkeypatch.setattr(herdr_backend.shutil, "which", lambda _name: None)
     monkeypatch.setenv("BMAD_LOOP_HERDR_STATE", str(tmp_path / "s.json"))
