@@ -7,7 +7,8 @@ workspace/tab model, so agent sessions, the TUI's launch/attach keys, log tees, 
 detection, and completion probes all run over herdr instead of tmux — including on hosts
 where tmux isn't an option.
 
-Characterized against **herdr 0.7.5** (server protocol **17**). Launches are native on
+Characterized against **herdr 0.7.5** (server protocol **17**, the minimum); the live
+suite also passes against herdr 0.9.5 (protocol 22) on Linux. Launches are native on
 both platform families and typed into a fresh tab's default shell via `pane run`: a
 typed `exec <argv>` on POSIX (Linux, macOS, WSL) and, on Windows, a typed
 `& <argv>; exit $LASTEXITCODE` in PowerShell, where parked windows run a

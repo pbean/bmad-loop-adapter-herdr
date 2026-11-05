@@ -14,6 +14,7 @@ import os
 import shlex
 import subprocess
 import sys
+import warnings
 from pathlib import Path
 
 import pytest
@@ -809,12 +810,27 @@ def test_protocol_below_supported_raises(fake):
         HerdrMultiplexer().new_session("bmad-loop-x", Path("/work"))
 
 
-def test_protocol_above_supported_warns_but_proceeds(fake):
-    fake.protocol = herdr_backend.SUPPORTED_PROTOCOL + 1
+def test_protocol_above_tested_warns_but_proceeds(fake):
+    fake.protocol = herdr_backend.TESTED_PROTOCOL + 1
     mux = HerdrMultiplexer()
-    with pytest.warns(UserWarning):
+    with pytest.warns(UserWarning, match="newer than tested"):
         mux.new_session("bmad-loop-x", Path("/work"))
     assert _creates(fake, "workspace", "create")  # created despite the warning
+
+
+@pytest.mark.parametrize(
+    "protocol",
+    [herdr_backend.SUPPORTED_PROTOCOL, herdr_backend.TESTED_PROTOCOL],
+    ids=["floor", "ceiling"],
+)
+def test_protocol_within_the_tested_range_is_silent(fake, protocol):
+    """Every protocol from the floor through the tested ceiling runs without a
+    warning. Ablation: warn above SUPPORTED_PROTOCOL again (the single-number
+    policy) and the ceiling case fails."""
+    fake.protocol = protocol
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        HerdrMultiplexer().new_session("bmad-loop-x", Path("/work"))
 
 
 # --------------------------------------------------------------- degradations
@@ -1072,6 +1088,38 @@ def test_switch_client_focuses_origin_tab(fake):
     # a gone target is honestly False; herdr has no "last client" to fall back to
     assert mux.switch_client("w9:p9") is False
     assert mux.switch_client("w9:p9", last_fallback=True) is False
+
+
+@pytest.mark.parametrize(
+    "outcome, expected",
+    [
+        (subprocess.TimeoutExpired(["herdr"], 5), None),
+        (OSError("spawn failed"), False),
+        ("refused", False),
+    ],
+    ids=["timeout", "spawn-fault", "refused"],
+)
+def test_switch_client_answers_none_only_when_the_focus_answer_never_came(
+    fake, monkeypatch, outcome, expected
+):
+    """False is the seam's joint claim (nothing moved AND the client is still
+    here), so a focus that timed out — and may have landed — is None instead.
+    A focus that never spawned or that the server refused moved nobody: False.
+    Ablation: fold TimeoutExpired back into the False branch and the timeout
+    case fails."""
+    fake.add_workspace("userws")
+    origin = fake.panes[-1]
+    real = fake._dispatch
+
+    def dispatch(cmd, argv):
+        if argv[:2] == ["tab", "focus"]:
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return fake._server_err(cmd, "tab_not_found", "tab focus: refused")
+        return real(cmd, argv)
+
+    monkeypatch.setattr(fake, "_dispatch", dispatch)
+    assert HerdrMultiplexer().switch_client(origin["pane_id"]) is expected
 
 
 def test_list_windows_tmux_field_mapping(fake):

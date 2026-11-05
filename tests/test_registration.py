@@ -12,9 +12,10 @@ psmux is absent/unavailable (or when herdr is explicitly forced).
 The ``fresh_registry`` fixture mirrors core's: snapshot/clear/restore the
 module-global registry, then replay this package's registration into the empty
 registry (import-time registration already ran once per process, so the clear
-would otherwise erase us). Builtins still load lazily inside ``_select`` —
-AFTER our entry — which is exactly the ordering an early entry-point import
-produces; every assertion here is name-keyed or first-match-stable under it.
+would otherwise erase us). ``register_multiplexer`` seeds the builtins first
+(bmad-loop #565), so tmux and psmux always precede herdr in registration order —
+the same order a real entry-point import produces. ``first-match`` and
+``fallback`` walk that order, so they answer a builtin wherever one matches.
 """
 
 from __future__ import annotations
@@ -139,15 +140,18 @@ def test_win32_psmux_is_platform_default_when_available(fresh_registry, monkeypa
     assert isinstance(fresh_registry.get_multiplexer(), HerdrMultiplexer)
 
 
-def test_win32_falls_back_to_herdr_even_when_unavailable(fresh_registry, monkeypatch):
+def test_win32_falls_back_to_psmux_not_herdr_when_nothing_is_available(fresh_registry, monkeypatch):
     """With no binary installed on win32, the historical fallback returns the first
-    platform match regardless of availability — herdr, once this adapter is
-    installed (without it, core bottom-falls-back to tmux)."""
+    platform match regardless of availability. psmux is a builtin, seeded ahead of
+    any external registration (bmad-loop #565), so it is that first match even with
+    this adapter installed — `validate` then reports the platform default missing,
+    not herdr. herdr wins on win32 only when it is available (first-match) or
+    forced."""
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setattr(shutil, "which", _which_only())  # nothing available
     backend, name, reason = fresh_registry._select()
-    assert isinstance(backend, HerdrMultiplexer)
-    assert (name, reason) == ("herdr", "fallback")
+    assert isinstance(backend, PsmuxMultiplexer)
+    assert (name, reason) == ("psmux", "fallback")
 
 
 def test_detect_multiplexers_lists_herdr_row(fresh_registry, monkeypatch):

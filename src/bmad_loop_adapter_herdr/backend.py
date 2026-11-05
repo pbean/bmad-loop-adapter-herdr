@@ -98,7 +98,10 @@ the native-Windows launch):**
   "last client" concept, so ``last_fallback`` has nothing to fall back to and
   a failed switch is honestly ``False``. Effect vs dispatch (the seam's rule):
   ``tab focus`` fails loudly on a tab that is not there, so its exit code does
-  mean the focus moved — no psmux-style measurement is needed on top.
+  mean the focus moved — no psmux-style measurement is needed on top. A
+  ``tab focus`` that times out answers ``None`` (the seam's "cannot vouch"),
+  since its answer never arrived and the focus may have moved regardless;
+  ``False`` stays reserved for exits that move nobody.
   **Residue:** what it cannot see is whether a *client* moved with the focus.
   herdr's TUI follows focus, but a raw ``herdr terminal attach`` is bound to one
   terminal stream and does not — so for such a client this would report an
@@ -121,8 +124,8 @@ the native-Windows launch):**
   foreground pids for core's kill escalation, degrading to ``[]`` on any
   failure (which callers read as "unknown", never "no processes").
 - ``detach_client`` answers ``False``, always — herdr detach is a keybinding
-  (``ctrl+b q``), with no CLI verb, and protocol 17 has no client/attach object
-  either, so there is nothing to dispatch AND nothing to measure the way psmux
+  (``ctrl+b q``), with no CLI verb, and protocols 17-22 have no client/attach
+  object either, so there is nothing to dispatch AND nothing to measure the way psmux
   counts attached clients across its exit-0 detach. ``False`` is what the seam
   asks of that case (bmad-loop #227: report effect, never a vacuous ``True``,
   which is the one answer that strands a human). Consequence: the *post-exit*
@@ -146,7 +149,8 @@ the native-Windows launch):**
   ``=session:name`` target and a read by native id agree.
 - ``new_session`` geometry (cols/lines) is **advisory** — herdr exposes no
   absolute headless resize; a detached pane takes an attaching client's size.
-- Protocol policy: fail below :data:`SUPPORTED_PROTOCOL`, warn once above.
+- Protocol policy: fail below :data:`SUPPORTED_PROTOCOL`, warn once above
+  :data:`TESTED_PROTOCOL`.
 
 See :mod:`bmad_loop.adapters.multiplexer` for the contract and the
 raisers-vs-sentinels split.
@@ -174,9 +178,15 @@ from bmad_loop.adapters.multiplexer import (
 )
 
 HERDR_TIMEOUT_S = 30
-# The herdr server wire protocol this backend was written against (0.7.5). Read
-# back from `herdr status --json` -> .server.protocol on the first server op.
+# The oldest herdr server wire protocol this backend runs on (0.7.5, the one it
+# was written against). Read back from `herdr status --json` -> .server.protocol
+# on the first server op; anything below is refused.
 SUPPORTED_PROTOCOL = 17
+# The newest protocol the live suite has passed against (herdr 0.9.5). Above it
+# the backend still runs but warns once. A floor and a ceiling, not one number:
+# raising the floor to the tested release would refuse every older install that
+# still works.
+TESTED_PROTOCOL = 22
 # How long _start_server waits for a freshly spawned `herdr server` to report
 # itself running before giving up. Module-level so tests can shrink it.
 SERVER_START_TIMEOUT_S = 5.0
@@ -568,7 +578,8 @@ class _HerdrClient:
         raise HerdrError(f"herdr server did not report running within {SERVER_START_TIMEOUT_S}s")
 
     def _check_protocol(self, server: dict) -> None:
-        """Fail below :data:`SUPPORTED_PROTOCOL`, warn once above. ``server`` is the
+        """Fail below :data:`SUPPORTED_PROTOCOL`, warn once above
+        :data:`TESTED_PROTOCOL`. ``server`` is the
         ``.server`` object from a ``status --json`` read (``protocol`` is ``null``
         when down — read the SERVER's, not the binary-local ``api schema``)."""
         proto = server.get("protocol")
@@ -578,10 +589,10 @@ class _HerdrClient:
             raise HerdrError(
                 f"herdr server protocol {proto} < required {SUPPORTED_PROTOCOL}; upgrade herdr"
             )
-        if proto > SUPPORTED_PROTOCOL and not self._proto_warned:
+        if proto > TESTED_PROTOCOL and not self._proto_warned:
             self._proto_warned = True
             warnings.warn(
-                f"herdr server protocol {proto} newer than tested {SUPPORTED_PROTOCOL}; "
+                f"herdr server protocol {proto} newer than tested {TESTED_PROTOCOL}; "
                 "proceeding but behavior is unverified",
                 stacklevel=2,
             )
@@ -1619,7 +1630,7 @@ class HerdrMultiplexer(TerminalMultiplexer):
         # Effect, not dispatch: False, always. herdr detach is a keybinding
         # (`ctrl+b q`) with no CLI verb, so nothing is dispatched — and there is
         # nothing to measure either, the way psmux counts a session's attached
-        # clients across its exit-0 detach: protocol 17 has no client/attach
+        # clients across its exit-0 detach: protocols 17-22 have no client/attach
         # object at all, so no probe can answer "did somebody leave". False is
         # what the widened seam wants for that case; a vacuous True is the one
         # answer that strands a human (bmad-loop #227), and it reaches the caller
@@ -1627,12 +1638,16 @@ class HerdrMultiplexer(TerminalMultiplexer):
         # into a window only a manual chord can release.
         return False
 
-    def switch_client(self, target: str, last_fallback: bool = False) -> bool:
+    def switch_client(self, target: str, last_fallback: bool = False) -> bool | None:
         # The herdr "switch client" move is a tab focus: focusing a tab also
         # flips workspace focus when it lives elsewhere (verified 0.7.5), so one
         # verb covers the whole return-to-origin hop. True iff the focus landed.
         # herdr has no "last client" concept, so last_fallback has nothing to
-        # fall back to and a failed switch is honestly False.
+        # fall back to and a failed switch is honestly False. False is the seam's
+        # joint claim (nothing moved AND the client is still here), so it is
+        # kept to the exits that move nobody: no target, a refused focus, a
+        # focus that never spawned. A focus whose answer never arrived may have
+        # landed anyway, so a timeout is None (cannot vouch), not False.
         pane_id = self._parse_target(target, strict=False)
         if pane_id is None:
             return False
@@ -1645,6 +1660,8 @@ class HerdrMultiplexer(TerminalMultiplexer):
             return False
         try:
             proc = self._client._run(["tab", "focus", tab_id], check=False)
+        except subprocess.TimeoutExpired:
+            return None
         except (subprocess.SubprocessError, OSError):
             return False
         return proc.returncode == 0

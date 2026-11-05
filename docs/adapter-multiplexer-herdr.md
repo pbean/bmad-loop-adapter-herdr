@@ -82,4 +82,6 @@ unattended either way.
   always resolves the first match, but a hand-made duplicate can shadow a run's real
   workspace.
 - **Version pin.** The backend is characterized against herdr **0.7.5** (server protocol
-  **17**): it refuses to run below that protocol and warns once above it.
+  **17**) and refuses to run below that protocol. The live suite also passes against
+  herdr **0.9.5** (protocol **22**) on Linux, so protocols 17 through 22 run silently; a
+  newer server still runs but warns once.

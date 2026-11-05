@@ -47,14 +47,23 @@ pytestmark = pytest.mark.skipif(not HAVE_HERDR, reason="herdr not available")
 # Same hook-instrumented fake as test_generic_tmux.py's FAKE_CLI (Python, so
 # write_portable_cli can spawn it on either platform family): the last
 # positional arg is the rendered prompt; the run dir + task id ride the pane env
-# (herdr `--env`, where tmux used `-e`). Emits SessionStart + result.json + Stop,
-# then idles like a live interactive session until its window is killed.
+# (herdr `--env`, where tmux used `-e`). A trailing `--session-id <id>` (the
+# claude profile's session_id_flag) is the caller-chosen session id: honor it as
+# real claude does, else "fake-1" — announcing any other id would mark the
+# session foreign and its Stop would never count. Emits SessionStart +
+# result.json + Stop, then idles like a live interactive session until its
+# window is killed.
 FAKE_CLI = """import json
 import os
 import sys
 import time
 
-prompt = sys.argv[-1]
+args = sys.argv[1:]
+sid = "fake-1"
+if len(args) >= 2 and args[-2] == "--session-id":
+    sid = args[-1]
+    args = args[:-2]
+prompt = args[-1]
 rd = os.environ["BMAD_LOOP_RUN_DIR"]
 tid = os.environ["BMAD_LOOP_TASK_ID"]
 ts = time.time_ns()
@@ -65,12 +74,12 @@ os.makedirs(os.path.join(rd, "tasks", tid), exist_ok=True)
 def event(ts_ns, name):
     path = os.path.join(rd, "events", "%d-%s-%s.json" % (ts_ns, tid, name))
     with open(path, "w", encoding="utf-8") as fh:
-        json.dump({"ts": ts_ns, "event": name, "task_id": tid, "session_id": "fake-1"}, fh)
+        json.dump({"ts": ts_ns, "event": name, "task_id": tid, "session_id": sid}, fh)
 
 
 event(ts, "SessionStart")
 with open(os.path.join(rd, "tasks", tid, "result.json"), "w", encoding="utf-8") as fh:
-    json.dump({"workflow": "auto-dev", "prompt": prompt}, fh)
+    json.dump({"workflow": "auto-dev", "prompt": prompt, "fake_sid": sid}, fh)
 event(ts + 1, "Stop")
 time.sleep(60)  # stay alive like an idle interactive session
 """
@@ -187,7 +196,12 @@ def test_herdr_end_to_end_with_fake_cli(tmp_path, herdr_session, profile_name):
     assert result.result_json["workflow"] == "auto-dev"
     # the fake echoes back the rendered prompt it received via the pane env
     assert result.result_json["prompt"] == adapter.profile.render_prompt(spec.prompt)
-    assert result.session_id == "fake-1"
+    # claude pins its own session id via --session-id; the others announce "fake-1"
+    assert result.session_id == result.result_json["fake_sid"]
+    if adapter.profile.session_id_flag:
+        assert result.session_id != "fake-1"
+    else:
+        assert result.session_id == "fake-1"
     assert (adapter.tasks_dir / "t-int-1" / "prompt.txt").read_text().strip() == spec.prompt
 
 
@@ -349,7 +363,7 @@ def test_herdr_env_fault_classified_from_the_tee(tmp_path, herdr_session):
         tmp_path,
         "import time\n"
         "time.sleep(2)\n"  # let the tee attach first: a pre-attach line is baseline
-        'print("API Error: Connection refused (ECONNREFUSED)", flush=True)\n'
+        'print("API Error: Unable to connect to API (ECONNREFUSED)", flush=True)\n'
         "time.sleep(60)\n",  # idle out the session clock, exactly as the outage does
     )
     adapter = _make_adapter(tmp_path, profile_name="claude", binary=str(fake), extra_args=())
@@ -374,7 +388,7 @@ def test_herdr_env_fault_classified_from_the_tee(tmp_path, herdr_session):
 def test_herdr_parked_window_via_start_detached(herdr_session, tmp_path):
     """PR-2 surface, live: launch.start_detached parks `bmad-loop validate` in a
     bmad-loop-ctl workspace tab. Pins the whole chain: tab-label discovery
-    (ctl_window through the list_windows join), the exit banner rendering while
+    (ctl_window_id through the list_windows join + project tag), the exit banner rendering while
     the window PARKS (stays alive) after the command exits, set_return_pane by
     tmux-style name target mirroring into the per-window return file, and Enter
     unparking — the trailer consumes the file, the pane closes (which is what
@@ -393,7 +407,7 @@ def test_herdr_parked_window_via_start_detached(herdr_session, tmp_path):
     assert isinstance(mux, herdr_backend.HerdrMultiplexer)  # no silent tmux fall-back
 
     # discovery: the ctl window comes back by its tab label
-    assert launch.ctl_window(run_id) == f"run-{run_id}"
+    assert launch.ctl_window_id(tmp_path, run_id) == win_id
 
     # validate exits quickly; the window must PARK with the EXPANDED banner
     # (the typed recipe itself contains the literal `$ec` text, so match the
