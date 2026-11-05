@@ -72,6 +72,25 @@ backward-compatible or internal.
   `workspace_not_found`) is ordinary teardown and stays silent. Teardown still never
   raises, and the sidecar cleanup runs either way.
 
+- **herdr up to 0.9.5 (protocol 22) runs without the "newer than tested" warning.** The
+  protocol policy is now a floor and a ceiling: below 17 is still refused, 17 through 22
+  run silently, and anything newer warns once. Nothing in herdr's 0.8.0–0.9.5 release
+  notes touches a verb this backend uses, and the live suite passes against 0.9.5. CI's
+  smoke step now checks the installed stable herdr against the floor instead of requiring
+  exactly protocol 17, which failed every build once stable moved past it.
+
+- **`switch_client` follows bmad-loop's three-answer seam.** Core widened the return to
+  `bool | None`, where `False` claims that nothing moved *and* the client is still here.
+  A `tab focus` that times out may have landed anyway, so it now answers `None` ("cannot
+  vouch"), which core reads as unreachable and stops prompting. A missing target, a
+  refused focus or a spawn fault still answer `False`.
+
+- Internal: the live tests track bmad-loop main. The fake CLI honors claude's
+  `--session-id` the way the tmux twin does, the env-fault fake prints the captured
+  `Unable to connect to API` line that the narrowed claude patterns match, the
+  parked-window test uses `ctl_window_id`, and the win32 no-binary fallback is psmux,
+  since core seeds its builtins ahead of external backends.
+
 - Internal: a contract-drift guard test compares every abstract seam method's signature
   against ours, so the next upstream widening fails a test instead of degrading silently;
   return-file cleanup goes through `platform_util.retrying_unlink` (win32 sharing-violation
